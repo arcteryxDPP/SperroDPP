@@ -477,7 +477,6 @@ let decoderStatus = 'checking'; // 'checking' | 'native' | 'fallback'
 document.getElementById('tabs').addEventListener('click', e=>{
   const b = e.target.closest('button[data-tab]');
   if(!b) return;
-  if(activeTab==='scan' && b.dataset.tab!=='scan') stopCamera();
   activeTab = b.dataset.tab;
   [...document.querySelectorAll('#tabs button')].forEach(x=>x.classList.toggle('active', x===b));
   render();
@@ -497,29 +496,15 @@ function render(){
 
 /* ============================= SCAN TAB ============================= */
 function renderScan(){
-  if(decoderStatus==='checking'){ checkDecoderSupport(); }
-  const decoderBadge = decoderStatus==='native'
-    ? `<span class="badge badge-pass">&#10003; Device decoder active</span>`
-    : decoderStatus==='fallback'
-      ? `<span class="badge badge-warn">Basic decoder only</span>`
-      : `<span class="badge badge-wo">Checking decoder…</span>`;
   return `
   <div class="card">
     <h2>Scan garment code</h2>
-    <p class="hint">Line the code up inside the box. Hold steady ~3–6in away with good light. If it won't pick up, try "Take Photo" below, or type / paste the serial / URL.</p>
-    <div style="margin:-4px 0 10px;">${decoderBadge}${decoderStatus==='fallback' ? ' <span style="color:var(--ink-dim); font-size:11.5px;">— low-contrast fabric-printed codes may not read reliably; see tips below.</span>' : ''}</div>
-    <div class="scan-wrap">
-      <video id="scan-video" playsinline muted style="display:${scanning ? 'block':'none'}"></video>
-      ${scanning ? '<div class="scan-frame"><div class="scan-box"></div></div>' : ''}
-    </div>
-    <canvas id="scan-canvas" style="display:none"></canvas>
-    <div class="row" style="margin-top:10px;">
-      ${scanning
-        ? `<button class="btn btn-ghost" id="btn-stop-cam">Stop camera</button>`
-        : `<button class="btn btn-primary" id="btn-start-cam">Start camera</button>`}
-      ${scanning && torchSupported ? `<button class="btn btn-ghost" id="btn-torch" style="flex:0 0 auto; width:auto; padding:12px 18px;">${torchOn?'&#128161; Off':'&#128161; Flash'}</button>` : ''}
-    </div>
-    <label style="margin-top:12px;">Hard to read live? Use a photo instead</label>
+    <p class="hint">Uses your Shortcut, which reads the code with Apple's own scanner — far more reliable on these labels than scanning in-browser. Lands you right back here with the result.</p>
+    <a href="shortcuts://run-shortcut?name=Scan%20DPP" class="btn btn-primary" style="width:100%; display:block; text-align:center; text-decoration:none; box-sizing:border-box;">&#128247; Open Scan Shortcut</a>
+    <p class="hint" style="margin-top:8px; margin-bottom:0;">First time? The Shortcut needs to be named exactly <span class="mono">Scan DPP</span> for this button to find it. If nothing happens when you tap it, open the Shortcuts app directly instead.</p>
+  </div>
+  <div class="card">
+    <label>No Shortcut set up yet? Use a photo instead</label>
     <p class="hint" style="margin-top:-2px;">Step 1: take the photo with the real Camera app (full quality, your own zoom/focus/flash). Step 2: come back here and upload it — it'll run through every decode pass we have.</p>
     <input type="file" accept="image/*" capture="environment" id="camera-open-input" style="display:none">
     <input type="file" accept="image/*" id="camera-upload-input" style="display:none">
@@ -621,16 +606,10 @@ function renderResultPanel(serial){
 
 function wireTabEvents(){
   if(activeTab==='scan'){
-    const startBtn = document.getElementById('btn-start-cam');
-    const stopBtn = document.getElementById('btn-stop-cam');
-    const torchBtn = document.getElementById('btn-torch');
     const photoOpenInput = document.getElementById('camera-open-input');
     const photoUploadInput = document.getElementById('camera-upload-input');
     const openCameraBtn = document.getElementById('btn-open-camera');
     const uploadPhotoBtn = document.getElementById('btn-upload-photo');
-    if(startBtn) startBtn.onclick = startCamera;
-    if(stopBtn) stopBtn.onclick = () => { stopCamera(); render(); };
-    if(torchBtn) torchBtn.onclick = toggleTorch;
     if(openCameraBtn) openCameraBtn.onclick = () => photoOpenInput.click();
     if(uploadPhotoBtn) uploadPhotoBtn.onclick = () => photoUploadInput.click();
     if(photoOpenInput) photoOpenInput.onchange = handlePhotoCapture;
@@ -654,7 +633,6 @@ function wireTabEvents(){
         alert("Couldn't read the clipboard directly (iOS sometimes blocks this outside a fresh tap). Paste into the field above instead.");
       }
     };
-    if(scanning) attachCameraLoop();
     if(currentResultMode === 'result' && currentResultSerial){
       document.getElementById('scan-result').innerHTML = renderResultPanel(currentResultSerial);
       bindResultButtons();
