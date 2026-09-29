@@ -151,11 +151,11 @@ function freshState(){
   };
 }
 
+/* ============================= LIVE SYNC (FIREBASE) — declared early so init below can use it ============================= */
+const FB_CONFIG_KEY = "arc_dpp_fb_config";
+let db = null, syncStatus = 'disconnected', syncError = null, syncListenersAttached = false;
+
 let state = load();
-{
-  const savedFbConfig = loadFirebaseConfig();
-  if(savedFbConfig) initFirebaseSync(savedFbConfig);
-}
 seedDefaultTargets();
 
 function load(){
@@ -177,12 +177,10 @@ function save(){
   catch(e){ alert("Could not save data on this device: " + e.message); }
 }
 
-/* ============================= LIVE SYNC (FIREBASE) ============================= */
+/* ============================= LIVE SYNC (FIREBASE) — rest of the engine ============================= */
 // Scope: workOrders, assignment, records, qcChecks sync live across devices.
 // The serial pool and scan history/log stay local-only — this keeps synced traffic small
 // and focused on exactly what needs to match across devices: targets and association status.
-const FB_CONFIG_KEY = "arc_dpp_fb_config";
-let db = null, syncStatus = 'disconnected', syncError = null, syncListenersAttached = false;
 
 function loadFirebaseConfig(){
   try{ const raw = localStorage.getItem(FB_CONFIG_KEY); return raw ? JSON.parse(raw) : null; }
@@ -1399,6 +1397,15 @@ function handleImportTargetBreakdown(e){
 
 /* ============================= INIT ============================= */
 render();
+
+// Auto-connect to a previously-saved Firebase config, if this device has one.
+// Deliberately placed at the very end of the script: initFirebaseSync() triggers render(),
+// which depends on state declared throughout this file — calling it any earlier risks a
+// "cannot access before initialization" error on variables not yet reached.
+{
+  const savedFbConfig = loadFirebaseConfig();
+  if(savedFbConfig) initFirebaseSync(savedFbConfig);
+}
 
 // Accepts a serial/URL handed in via ?scan=... (e.g. from an iOS Shortcut using Apple's
 // own native barcode scanner) and shows the result immediately, no typing or pasting needed.
