@@ -205,24 +205,41 @@ function attachSyncListeners(){
   if(!db || syncListenersAttached) return;
   syncListenersAttached = true;
   db.collection('workOrders').onSnapshot(snap=>{
+    if(snap.empty && state.workOrders.length){
+      const seed = {}; state.workOrders.forEach(wo=>{ seed[wo.id]=wo; });
+      pushBatchDocs('workOrders', seed);
+      return;
+    }
     const wos = [];
     snap.forEach(doc => wos.push(doc.data()));
     state.workOrders = wos;
     save(); render();
   }, err=>{ syncStatus='error'; syncError=err.message; render(); });
   db.collection('assignment').onSnapshot(snap=>{
+    if(snap.empty && Object.keys(state.assignment).length){
+      pushBatchDocs('assignment', state.assignment);
+      return;
+    }
     const a = {};
     snap.forEach(doc => a[doc.id] = doc.data());
     state.assignment = a;
     save(); render();
   }, err=>{ syncStatus='error'; syncError=err.message; render(); });
   db.collection('records').onSnapshot(snap=>{
+    if(snap.empty && Object.keys(state.records).length){
+      pushBatchDocs('records', state.records);
+      return;
+    }
     const r = {};
     snap.forEach(doc => r[doc.id] = doc.data());
     state.records = r;
     save(); render();
   }, err=>{ syncStatus='error'; syncError=err.message; render(); });
   db.collection('qcChecks').onSnapshot(snap=>{
+    if(snap.empty && Object.keys(state.qcChecks).length){
+      pushBatchDocs('qcChecks', state.qcChecks);
+      return;
+    }
     const q = {};
     snap.forEach(doc => q[doc.id] = doc.data());
     state.qcChecks = q;
