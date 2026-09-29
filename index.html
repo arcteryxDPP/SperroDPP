@@ -6,6 +6,8 @@
 <title>SPERRO DPP Association Tracker</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <style>
   :root{
     --bg:#14171A; --panel:#1D2125; --panel2:#22272C; --line:#323A40;
@@ -150,6 +152,10 @@ function freshState(){
 }
 
 let state = load();
+{
+  const savedFbConfig = loadFirebaseConfig();
+  if(savedFbConfig) initFirebaseSync(savedFbConfig);
+}
 seedDefaultTargets();
 
 function load(){
@@ -171,27 +177,115 @@ function save(){
   catch(e){ alert("Could not save data on this device: " + e.message); }
 }
 
+/* ============================= LIVE SYNC (FIREBASE) ============================= */
+// Scope: workOrders, assignment, records, qcChecks sync live across devices.
+// The serial pool and scan history/log stay local-only — this keeps synced traffic small
+// and focused on exactly what needs to match across devices: targets and association status.
+const FB_CONFIG_KEY = "arc_dpp_fb_config";
+let db = null, syncStatus = 'disconnected', syncError = null, syncListenersAttached = false;
+
+function loadFirebaseConfig(){
+  try{ const raw = localStorage.getItem(FB_CONFIG_KEY); return raw ? JSON.parse(raw) : null; }
+  catch(e){ return null; }
+}
+function saveFirebaseConfig(cfg){ localStorage.setItem(FB_CONFIG_KEY, JSON.stringify(cfg)); }
+function clearFirebaseConfig(){ localStorage.removeItem(FB_CONFIG_KEY); }
+
+function initFirebaseSync(config){
+  try{
+    if(!firebase.apps || !firebase.apps.length) firebase.initializeApp(config);
+    db = firebase.firestore();
+    attachSyncListeners();
+    syncStatus = 'connected'; syncError = null;
+  }catch(e){
+    db = null; syncStatus = 'error'; syncError = e.message;
+  }
+  render();
+}
+
+function attachSyncListeners(){
+  if(!db || syncListenersAttached) return;
+  syncListenersAttached = true;
+  db.collection('workOrders').onSnapshot(snap=>{
+    const wos = [];
+    snap.forEach(doc => wos.push(doc.data()));
+    state.workOrders = wos;
+    save(); render();
+  }, err=>{ syncStatus='error'; syncError=err.message; render(); });
+  db.collection('assignment').onSnapshot(snap=>{
+    const a = {};
+    snap.forEach(doc => a[doc.id] = doc.data());
+    state.assignment = a;
+    save(); render();
+  }, err=>{ syncStatus='error'; syncError=err.message; render(); });
+  db.collection('records').onSnapshot(snap=>{
+    const r = {};
+    snap.forEach(doc => r[doc.id] = doc.data());
+    state.records = r;
+    save(); render();
+  }, err=>{ syncStatus='error'; syncError=err.message; render(); });
+  db.collection('qcChecks').onSnapshot(snap=>{
+    const q = {};
+    snap.forEach(doc => q[doc.id] = doc.data());
+    state.qcChecks = q;
+    save(); render();
+  }, err=>{ syncStatus='error'; syncError=err.message; render(); });
+}
+
+function pushWO(wo){ if(!db || !wo) return; db.collection('workOrders').doc(wo.id).set(wo).catch(e=>console.error('sync: push WO failed', e)); }
+function pushAssignment(serial){ if(!db || !state.assignment[serial]) return; db.collection('assignment').doc(serial).set(state.assignment[serial]).catch(e=>console.error('sync: push assignment failed', e)); }
+function pushRecord(serial){ if(!db || !state.records[serial]) return; db.collection('records').doc(serial).set(state.records[serial]).catch(e=>console.error('sync: push record failed', e)); }
+function pushQcCheck(serial){ if(!db || !state.qcChecks[serial]) return; db.collection('qcChecks').doc(serial).set(state.qcChecks[serial]).catch(e=>console.error('sync: push qcCheck failed', e)); }
+function pushWODelete(id){ if(!db) return; db.collection('workOrders').doc(id).delete().catch(e=>console.error('sync: delete WO failed', e)); }
+
+function pushBatchDocs(collectionName, docsMap){
+  if(!db) return;
+  const entries = Object.entries(docsMap);
+  const chunkSize = 400;
+  for(let i=0; i<entries.length; i+=chunkSize){
+    const chunk = entries.slice(i, i+chunkSize);
+    const batch = db.batch();
+    chunk.forEach(([id, data])=>{ batch.set(db.collection(collectionName).doc(id), data); });
+    batch.commit().catch(e=>console.error('sync: batch push failed for '+collectionName, e));
+  }
+}
+
 /* ============================= HELPERS ============================= */
 function uid(){ return Math.random().toString(36).slice(2,9); }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 function fmtTime(ts){ const d = new Date(ts); return d.toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}); }
 
-function extractSerial(raw){
-  if(!raw) return null;
+function classifyScan(raw){
+  if(!raw) return {kind:'empty'};
   const s = raw.trim();
   try{
     const url = new URL(s);
     const itemId = url.searchParams.get('itemId');
-    if(itemId) return itemId.trim();
+    if(itemId) return {kind:'serial', value: itemId.trim()};
     const segments = url.pathname.split('/').filter(Boolean);
-    if(segments.length) return segments[segments.length-1].trim();
-    return null;
+    if(segments.length) return {kind:'serial', value: segments[segments.length-1].trim()};
+    // Valid URL, no itemId, no path segments — this is the bare arcteryx.com homepage,
+    // which is exactly what the system redirects to for a confirmed non-associated unit.
+    return {kind:'confirmedFail'};
   }catch(e){
-    if(!s.includes('/')) return s.split('?')[0].trim() || null;
+    if(!s.includes('/')){
+      const v = s.split('?')[0].trim();
+      return v ? {kind:'serial', value:v} : {kind:'empty'};
+    }
     const parts = s.split('/').filter(Boolean);
     const last = (parts[parts.length-1] || '').split('?')[0].trim();
-    return last || null;
+    return last ? {kind:'serial', value:last} : {kind:'empty'};
   }
+}
+function extractSerial(raw){
+  const c = classifyScan(raw);
+  return c.kind === 'serial' ? c.value : null;
+}
+function handleScanInput(raw){
+  const c = classifyScan(raw);
+  if(c.kind === 'serial'){ showResult(c.value, raw); return true; }
+  if(c.kind === 'confirmedFail'){ showConfirmedFail(raw); return true; }
+  return false;
 }
 
 function poolStats(){
@@ -239,6 +333,7 @@ function deleteWorkOrder(id){
   state.workOrders = state.workOrders.filter(w=>w.id!==id);
   state.history = state.history.filter(h => h.woId !== id);
   save();
+  pushWODelete(id);
   render();
 }
 
@@ -277,6 +372,7 @@ function seedDefaultTargets(){
       wo.sizes.push({ id: uid(), colour: sz.colour, size: sz.size, qty: sz.qty||0, sku: sz.sku||null });
     });
     state.workOrders.push(wo);
+    pushWO(wo);
     added++;
   });
   if(added) save();
@@ -295,6 +391,8 @@ function assignSerialToWO(serial, woId, colour, size){
   findOrCreateSizeRow(wo, colour, size);
   state.assignment[serial] = { woId: wo.id, woNumber: wo.woNumber, colour, size };
   save();
+  pushAssignment(serial);
+  pushWO(wo);
 }
 
 /* ============================= SCAN LOGIC ============================= */
@@ -307,6 +405,7 @@ function lookupSerial(serial){
 
 function markQcChecked(serial, result){
   state.qcChecks[serial] = { ts: Date.now(), result };
+  pushQcCheck(serial);
 }
 
 function logResult(serial, status, source){
@@ -323,6 +422,7 @@ function logResult(serial, status, source){
   state.history.unshift({ serial, ts: rec.ts, status, woNumber: rec.woNumber, size: rec.size, colour: rec.colour, source: rec.source });
   if(!state.pool.includes(serial)) state.pool.push(serial);
   save();
+  pushRecord(serial);
 }
 
 /* ============================= WO STATS / FLAGGING ============================= */
@@ -354,6 +454,7 @@ function woStats(wo){
 /* ============================= RENDER: ROUTER ============================= */
 let activeTab = 'scan';
 let scanning = false, videoStream = null, rafId = null, lastDecodedAt = 0, currentResultSerial = null;
+let currentResultRaw = null, assignFallbackOpen = false, currentResultMode = null; // null | 'result' | 'confirmedFail'
 let torchSupported = false, torchOn = false;
 let barcodeDetector = null, detectBusy = false;
 let decoderStatus = 'checking'; // 'checking' | 'native' | 'fallback'
@@ -369,7 +470,7 @@ document.getElementById('tabs').addEventListener('click', e=>{
 
 function render(){
   const {total} = poolStats();
-  document.getElementById('run-id-label').textContent = `${total.toLocaleString()} serials loaded${state.lastSyncedAt ? ' · synced '+fmtTime(state.lastSyncedAt) : ''}`;
+  document.getElementById('run-id-label').textContent = `${total.toLocaleString()} serials loaded${syncStatus==='connected' ? ' · live sync on' : ''}${state.lastSyncedAt ? ' · synced '+fmtTime(state.lastSyncedAt) : ''}`;
   const app = document.getElementById('app');
   if(activeTab==='scan') app.innerHTML = renderScan();
   else if(activeTab==='dashboard') app.innerHTML = renderDashboard();
@@ -448,20 +549,26 @@ function renderResultPanel(serial){
   if(!assign){
     border = 'var(--warn)';
     const woOptions = state.workOrders.map(w=>`<option value="${w.id}">WO ${esc(w.woNumber)}</option>`).join('');
+    const isUrl = currentResultRaw && /^https?:\/\//i.test(currentResultRaw);
     body = `
       <div class="result-serial">${esc(serial)}</div>
-      <div style="margin-top:8px;"><span class="badge badge-warn">${inPool ? 'Not assigned to a Work Order' : 'Unknown serial'}</span></div>
-      <p class="hint" style="margin-top:10px;">${inPool ? "This serial hasn't been linked to a Work Order yet." : "This serial isn't in the loaded pool yet, but you can still assign it below if you know where it belongs."} Pick the Work Order, colour and size to assign it now, or scan next to skip.</p>
-      ${state.workOrders.length ? `
-      <label>Work Order</label>
-      <select id="assign-wo">${woOptions}</select>
-      <div class="row">
-        <div><label>Colour</label><input type="text" id="assign-colour" placeholder="e.g. Cabernet"></div>
-        <div><label>Size</label><input type="text" id="assign-size" placeholder="e.g. M"></div>
-      </div>
-      <button class="btn btn-primary" id="btn-assign" style="width:100%;">Assign &amp; continue</button>
-      ` : `<p class="hint">No Work Orders exist yet — create one in the Work Orders tab first.</p>`}
-      <button class="btn btn-ghost" id="btn-rescan" style="width:100%; margin-top:8px;">Scan next</button>`;
+      <div style="margin-top:8px;"><span class="badge badge-warn">${inPool ? 'Not linked to a Work Order' : 'Not recognized'}</span></div>
+      <p class="hint" style="margin-top:10px;">${inPool ? "This serial exists but hasn't been linked to a Work Order yet." : "This serial isn't in our loaded data yet."} That doesn't necessarily mean it's unassociated — it may just be missing from an import. Double-check if you have the link, or assign it below if you know where it belongs.</p>
+      ${isUrl ? `<a href="${esc(currentResultRaw)}" target="_blank" class="btn btn-ghost" style="width:100%; display:block; text-align:center; text-decoration:none; box-sizing:border-box;">Double-check this link manually</a>` : ''}
+      <button class="btn btn-ghost" id="btn-rescan" style="width:100%; margin-top:8px;">Scan next</button>
+      <button id="btn-toggle-assign" style="width:100%; margin-top:14px; background:none; border:none; color:var(--ink-dim); font-size:12px; text-decoration:underline; padding:4px;">${assignFallbackOpen ? 'Hide assignment form' : 'Assign to a Work Order'}</button>
+      <div id="assign-fallback" style="display:${assignFallbackOpen ? 'block':'none'}; margin-top:8px;">
+        ${state.workOrders.length ? `
+        <label>Work Order</label>
+        <select id="assign-wo">${woOptions}</select>
+        <div class="row">
+          <div><label>Colour</label><input type="text" id="assign-colour" placeholder="e.g. Cabernet"></div>
+          <div><label>Size</label><input type="text" id="assign-size" placeholder="e.g. M"></div>
+        </div>
+        <button class="btn btn-primary" id="btn-assign" style="width:100%;">Assign &amp; continue</button>
+        <button class="btn btn-fail" id="btn-confirm-notassoc" style="width:100%; margin-top:8px;">&#10005; Checked it — actually not associated, send back to line</button>
+        ` : `<p class="hint">No Work Orders exist yet — create one in the Work Orders tab first.</p>`}
+      </div>`;
   } else if(record && record.status==='pass'){
     // Already known to be associated (from an import or an earlier scan) — auto-confirmed, no manual decision needed.
     border = 'var(--pass)';
@@ -515,34 +622,30 @@ function wireTabEvents(){
     if(photoUploadInput) photoUploadInput.onchange = handlePhotoCapture;
     const manualBtn = document.getElementById('btn-manual-lookup');
     const manualInput = document.getElementById('manual-input');
-    const noSerialMsg = "No product identifier found in that link. If it's the plain arcteryx.com homepage, that usually means this unit isn't associated — but that page carries no serial, so it can't be identified from a pasted link alone. Re-scan it with the camera above instead (it reads the code directly, before any redirect).";
+    const noSerialMsg = "Couldn't find a product identifier or link in that — check what you typed or pasted.";
     if(manualBtn) manualBtn.onclick = () => {
-      const val = extractSerial(manualInput.value);
-      if(!val){ alert(noSerialMsg); return; }
-      showResult(val);
+      if(!handleScanInput(manualInput.value)) alert(noSerialMsg);
     };
     if(manualInput) manualInput.addEventListener('keydown', e=>{ if(e.key==='Enter'){ manualBtn.click(); }});
     if(manualInput) manualInput.addEventListener('paste', ()=>{
-      setTimeout(()=>{
-        const val = extractSerial(manualInput.value);
-        if(val) showResult(val); else alert(noSerialMsg);
-      }, 0);
+      setTimeout(()=>{ if(!handleScanInput(manualInput.value)) alert(noSerialMsg); }, 0);
     });
     const pasteBtn = document.getElementById('btn-paste-clipboard');
     if(pasteBtn) pasteBtn.onclick = async () => {
       try{
         const text = await navigator.clipboard.readText();
-        const val = extractSerial(text);
-        if(val) showResult(val);
-        else alert(noSerialMsg);
+        if(!handleScanInput(text)) alert(noSerialMsg);
       }catch(e){
         alert("Couldn't read the clipboard directly (iOS sometimes blocks this outside a fresh tap). Paste into the field above instead.");
       }
     };
     if(scanning) attachCameraLoop();
-    if(currentResultSerial){
+    if(currentResultMode === 'result' && currentResultSerial){
       document.getElementById('scan-result').innerHTML = renderResultPanel(currentResultSerial);
       bindResultButtons();
+    } else if(currentResultMode === 'confirmedFail'){
+      document.getElementById('scan-result').innerHTML = renderConfirmedFailPanel();
+      bindConfirmedFailButtons();
     }
   } else if(activeTab==='workorders'){
     bindWorkOrderEvents();
@@ -561,10 +664,14 @@ function bindResultButtons(){
   const rescanBtn = document.getElementById('btn-rescan');
   const assignBtn = document.getElementById('btn-assign');
   const overrideBtn = document.getElementById('btn-override-fail');
-  if(passBtn) passBtn.onclick = () => { logResult(currentResultSerial,'pass','scan'); currentResultSerial=null; render(); };
-  if(failBtn) failBtn.onclick = () => { logResult(currentResultSerial,'fail','scan'); currentResultSerial=null; render(); };
-  if(rescanBtn) rescanBtn.onclick = () => { currentResultSerial=null; render(); };
-  if(overrideBtn) overrideBtn.onclick = () => { logResult(currentResultSerial,'fail','scan'); currentResultSerial=null; render(); };
+  const confirmNotAssocBtn = document.getElementById('btn-confirm-notassoc');
+  const toggleAssignBtn = document.getElementById('btn-toggle-assign');
+  if(passBtn) passBtn.onclick = () => { logResult(currentResultSerial,'pass','scan'); currentResultSerial=null; currentResultMode=null; render(); };
+  if(failBtn) failBtn.onclick = () => { logResult(currentResultSerial,'fail','scan'); currentResultSerial=null; currentResultMode=null; render(); };
+  if(rescanBtn) rescanBtn.onclick = () => { currentResultSerial=null; currentResultMode=null; render(); };
+  if(overrideBtn) overrideBtn.onclick = () => { logResult(currentResultSerial,'fail','scan'); currentResultSerial=null; currentResultMode=null; render(); };
+  if(confirmNotAssocBtn) confirmNotAssocBtn.onclick = () => { logResult(currentResultSerial,'fail','scan'); currentResultSerial=null; currentResultMode=null; render(); };
+  if(toggleAssignBtn) toggleAssignBtn.onclick = () => { assignFallbackOpen = !assignFallbackOpen; document.getElementById('scan-result').innerHTML = renderResultPanel(currentResultSerial); bindResultButtons(); };
   if(assignBtn) assignBtn.onclick = () => {
     const woId = document.getElementById('assign-wo').value;
     const colour = document.getElementById('assign-colour').value.trim();
@@ -576,8 +683,11 @@ function bindResultButtons(){
   };
 }
 
-function showResult(serial){
+function showResult(serial, raw){
+  currentResultMode = 'result';
   currentResultSerial = serial;
+  currentResultRaw = raw || null;
+  assignFallbackOpen = false;
   // If this unit is already known to be associated (via an import or an earlier scan),
   // automatically log the QC check — no manual Pass/Fail tap required.
   const {assign, record} = lookupSerial(serial);
@@ -589,6 +699,38 @@ function showResult(serial){
   document.getElementById('scan-result').innerHTML = renderResultPanel(serial);
   bindResultButtons();
   document.getElementById('manual-input') && (document.getElementById('manual-input').value = '');
+}
+
+function showConfirmedFail(raw){
+  currentResultMode = 'confirmedFail';
+  currentResultSerial = null;
+  currentResultRaw = raw || null;
+  document.getElementById('scan-result').innerHTML = renderConfirmedFailPanel();
+  bindConfirmedFailButtons();
+  document.getElementById('manual-input') && (document.getElementById('manual-input').value = '');
+}
+
+function renderConfirmedFailPanel(){
+  return `<div class="card result-card" style="border-color:var(--fail)">
+    <div style="display:flex; gap:6px; flex-wrap:wrap;"><span class="badge badge-fail">Not associated — confirmed</span></div>
+    <p class="hint" style="margin-top:10px; color:var(--text-primary);">The link redirected straight to the general arcteryx.com site with no product reference at all — that's exactly what happens when a unit hasn't been associated yet. Send it back to the production line, then re-scan once it's linked.</p>
+    <p class="hint" style="margin-top:6px;">Because this page carries no identifier, this can't be tied to a specific serial from here — it's logged as an unmatched fail. If you know which unit it was, look it up directly by serial once you've checked it.</p>
+    <button class="btn btn-fail" id="btn-confirm-fail-noserial" style="width:100%;">&#10005; Confirm — send back to line</button>
+    ${currentResultRaw ? `<a href="${esc(currentResultRaw)}" target="_blank" class="btn btn-ghost" style="width:100%; margin-top:8px; display:block; text-align:center; text-decoration:none; box-sizing:border-box;">Double-check this link manually</a>` : ''}
+    <button class="btn btn-ghost" id="btn-rescan-noserial" style="width:100%; margin-top:8px;">Scan next</button>
+  </div>`;
+}
+
+function bindConfirmedFailButtons(){
+  const confirmBtn = document.getElementById('btn-confirm-fail-noserial');
+  const rescanBtn = document.getElementById('btn-rescan-noserial');
+  if(confirmBtn) confirmBtn.onclick = () => {
+    state.history.unshift({ serial: '(no identifier)', ts: Date.now(), status:'fail', woNumber:null, size:null, colour:null, source:'scan' });
+    save();
+    currentResultMode = null; currentResultRaw = null;
+    render();
+  };
+  if(rescanBtn) rescanBtn.onclick = () => { currentResultMode = null; currentResultRaw = null; render(); };
 }
 
 async function checkDecoderSupport(){
@@ -683,10 +825,8 @@ function attachCameraLoop(){
         const now = Date.now();
         if(raw && (now - lastDecodedAt > 1500)){
           lastDecodedAt = now;
-          const serial = extractSerial(raw);
-          if(serial){
+          if(handleScanInput(raw)){
             if(navigator.vibrate) navigator.vibrate(80);
-            showResult(serial);
           }
         }
       } finally {
@@ -785,11 +925,11 @@ async function handlePhotoCapture(e){
     ctx.drawImage(bitmap, 0, 0, w, h);
     const raw = await tryDecodeVariants(canvas, ctx);
     if(raw){
-      const serial = extractSerial(raw);
       if(navigator.vibrate) navigator.vibrate(80);
       if(statusEl) statusEl.innerHTML = '';
-      if(serial) showResult(serial);
-      else if(statusEl) statusEl.innerHTML = `<p class="hint" style="color:var(--warn);">Read a code, but couldn't find a product identifier in it. That link may not carry a serial — try re-scanning instead.</p>`;
+      if(!handleScanInput(raw)){
+        if(statusEl) statusEl.innerHTML = `<p class="hint" style="color:var(--warn);">Read a code, but couldn't find a product identifier in it. That link may not carry a serial — try re-scanning instead.</p>`;
+      }
     } else {
       if(statusEl) statusEl.innerHTML = `<p class="hint" style="color:var(--warn);">Couldn't read a code in that photo. Try retaking it closer/further away with more even light, or use manual entry below.</p>`;
     }
@@ -1002,7 +1142,23 @@ function exportCSV(){
 /* ============================= SETTINGS TAB ============================= */
 function renderSettings(){
   const {total, assigned, unassigned} = poolStats();
+  const statusBadge = syncStatus==='connected' ? '<span class="badge badge-pass">&#10003; Connected — syncing live</span>'
+    : syncStatus==='error' ? '<span class="badge badge-fail">Connection error</span>'
+    : '<span class="badge badge-wo">Not connected — local only</span>';
   return `<div class="card">
+    <h2>Live sync (Firebase)</h2>
+    <p class="hint">Connects Work Orders, associations, and QC checks across every device that uses this same link — so this device's Dashboard shows what's happened everywhere else too, not just on this iPad. The serial pool and Log stay local to each device.</p>
+    <div style="margin-bottom:10px;">${statusBadge}</div>
+    ${syncStatus==='error' ? `<p class="hint" style="color:var(--fail);">${esc(syncError||'Unknown error')}</p>` : ''}
+    ${syncStatus==='connected' ? `
+      <button class="btn btn-ghost" id="btn-fb-disconnect" style="width:100%;">Disconnect</button>
+    ` : `
+      <label>Paste your Firebase config here</label>
+      <textarea id="fb-config-input" rows="5" placeholder='{"apiKey":"...","projectId":"...", ...}' style="width:100%; background:var(--panel2); border:1px solid var(--line); color:var(--ink); padding:10px; border-radius:8px; font-family:var(--mono); font-size:12px; margin-bottom:10px;"></textarea>
+      <button class="btn btn-primary" id="btn-fb-connect" style="width:100%;">Connect</button>
+    `}
+  </div>
+  <div class="card">
     <h2>Serial pool</h2>
     <div class="stat-grid">
       <div class="stat"><div class="n">${total.toLocaleString()}</div><div class="l">Total loaded</div></div>
@@ -1030,12 +1186,28 @@ function renderSettings(){
     <p class="hint">This clears all Work Orders, scan history, and assignments on this device, and reloads the original ${DEFAULT_SERIALS.length.toLocaleString()}-serial pool. This cannot be undone.</p>
     <button class="btn btn-fail" id="btn-reset" style="width:100%;">Reset all data on this device</button>
   </div>
-  <div class="footer-note">Data is stored only in this browser on this device. Nothing is sent anywhere.</div>`;
+  <div class="footer-note">${syncStatus==='connected' ? 'Work Orders, associations, and QC checks sync live. The serial pool and Log stay on this device only.' : 'Data is stored only in this browser on this device. Nothing is sent anywhere unless Live sync is connected above.'}</div>`;
 }
 function bindSettingsEvents(){
   document.getElementById('file-import').onchange = handleImportFile;
   document.getElementById('file-import-assoc').onchange = handleImportAssociationReport;
   document.getElementById('file-import-targets').onchange = handleImportTargetBreakdown;
+  const fbConnectBtn = document.getElementById('btn-fb-connect');
+  const fbDisconnectBtn = document.getElementById('btn-fb-disconnect');
+  if(fbConnectBtn) fbConnectBtn.onclick = () => {
+    const raw = document.getElementById('fb-config-input').value.trim();
+    let cfg;
+    try{ cfg = JSON.parse(raw); }
+    catch(e){ alert('That doesn\'t look like valid config — paste the full {...} object from Firebase, exactly as copied.'); return; }
+    saveFirebaseConfig(cfg);
+    initFirebaseSync(cfg);
+  };
+  if(fbDisconnectBtn) fbDisconnectBtn.onclick = () => {
+    if(!confirm('Disconnect live sync on this device? Local data stays put, but this device will stop sending or receiving updates.')) return;
+    clearFirebaseConfig();
+    db = null; syncStatus = 'disconnected'; syncError = null; syncListenersAttached = false;
+    render();
+  };
   document.getElementById('btn-reset').onclick = () => {
     if(confirm('Reset ALL data on this device? This cannot be undone.')){
       if(confirm('Really sure? Work Orders and scan history will be permanently lost.')){
@@ -1090,6 +1262,7 @@ function handleImportAssociationReport(e){
     try{
       const wb = XLSX.read(evt.target.result, {type:'array'});
       let created=0, updated=0, skippedNoPO=0, skippedTest=0;
+      const touchedWOs = {}, touchedAssignments = {}, touchedRecords = {};
       wb.SheetNames.forEach(name=>{
         const ws = wb.Sheets[name];
         const rows = XLSX.utils.sheet_to_json(ws, {header:1});
@@ -1117,11 +1290,14 @@ function handleImportAssociationReport(e){
 
           const wo = findOrCreateWO(woNumber);
           findOrCreateSizeRow(wo, colour, size);
+          touchedWOs[wo.id] = wo;
           const isNewSerial = !state.assignment[serial];
           state.assignment[serial] = { woId: wo.id, woNumber, colour, size };
+          touchedAssignments[serial] = state.assignment[serial];
           if(!state.pool.includes(serial)) state.pool.push(serial);
           const wasPass = state.records[serial] && state.records[serial].status==='pass';
           state.records[serial] = { status:'pass', ts, size, woId:wo.id, woNumber, colour, source:'import' };
+          touchedRecords[serial] = state.records[serial];
           if(isNewSerial || !wasPass){
             state.history.unshift({ serial, ts, status:'pass', woNumber, size, colour, source:'import' });
             updated++;
@@ -1130,6 +1306,9 @@ function handleImportAssociationReport(e){
         }
       });
       save();
+      pushBatchDocs('workOrders', touchedWOs);
+      pushBatchDocs('assignment', touchedAssignments);
+      pushBatchDocs('records', touchedRecords);
       state.lastSyncedAt = Date.now(); save();
       alert(`Import complete.\n${created} new serial(s) linked, ${updated} association record(s) written.\nSkipped: ${skippedNoPO} with no PO number, ${skippedTest} test/UAT/non-production rows.`);
       render();
@@ -1162,6 +1341,7 @@ function handleImportTargetBreakdown(e){
     try{
       const wb = XLSX.read(evt.target.result, {type:'array'});
       let woCreated=0, rowsSet=0, rowsSkippedBlank=0, rowsNoWO=0;
+      const touchedWOs = {};
       wb.SheetNames.forEach(name=>{
         const ws = wb.Sheets[name];
         const rows = XLSX.utils.sheet_to_json(ws, {header:1});
@@ -1202,10 +1382,12 @@ function handleImportTargetBreakdown(e){
           if(!existedBefore) woCreated++;
           const sizeRow = findOrCreateSizeRow(wo, lastColor, size, sku);
           if(!sizeRow.qty) sizeRow.qty = qty;
+          touchedWOs[wo.id] = wo;
           rowsSet++;
         }
       });
       save();
+      pushBatchDocs('workOrders', touchedWOs);
       alert(`Import complete.\n${woCreated} Work Order(s) created, ${rowsSet} colour/size target(s) set.\n${rowsNoWO} row(s) skipped (no Work Order number), ${rowsSkippedBlank} row(s) with an unreadable quantity.`);
       render();
     }catch(err){
@@ -1226,8 +1408,7 @@ render();
     if(params.has('scan')){
       const raw = params.get('scan');
       history.replaceState({}, '', location.pathname);
-      const serial = extractSerial(raw);
-      if(serial) showResult(serial);
+      handleScanInput(raw);
     }
   }catch(e){ /* no-op — malformed param shouldn't break the app */ }
 })();
