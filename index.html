@@ -1200,6 +1200,16 @@ function renderSettings(){
     `}
   </div>
   <div class="card">
+    <h2>Correct a serial's assignment</h2>
+    <p class="hint">Fixes a serial that was linked to the wrong Work Order, colour, or size — e.g. a QC mis-entry. This updates both the assignment and its association status, and syncs immediately to every connected device.</p>
+    <label>Serial</label>
+    <div class="row">
+      <input type="text" id="correct-serial-input" placeholder="e.g. H3Mv9W3yiq" class="mono">
+    </div>
+    <button class="btn btn-ghost" id="btn-correct-lookup" style="width:100%;">Look up</button>
+    <div id="correct-result">${renderCorrectResult()}</div>
+  </div>
+  <div class="card">
     <h2>Serial pool</h2>
     <div class="stat-grid">
       <div class="stat"><div class="n">${total.toLocaleString()}</div><div class="l">Total loaded</div></div>
@@ -1229,10 +1239,69 @@ function renderSettings(){
   </div>
   <div class="footer-note">${syncStatus==='connected' ? 'Work Orders, associations, and QC checks sync live. The serial pool and Log stay on this device only.' : 'Data is stored only in this browser on this device. Nothing is sent anywhere unless Live sync is connected above.'}</div>`;
 }
+let correctingSerial = null;
+
+function renderCorrectResult(){
+  if(!correctingSerial) return '';
+  const serial = correctingSerial;
+  const assign = state.assignment[serial];
+  const rec = state.records[serial];
+  const qc = state.qcChecks[serial];
+  const woOptions = state.workOrders.map(w=>`<option value="${w.id}" ${assign && w.id===assign.woId ? 'selected':''}>WO ${esc(w.woNumber)}</option>`).join('');
+  return `<div class="wo-card" style="margin-top:10px;">
+    <div class="result-serial" style="font-size:16px;">${esc(serial)}</div>
+    ${assign ? `
+      <p class="hint" style="margin-top:6px;">Currently: WO ${esc(assign.woNumber)} &middot; ${esc(assign.colour)} &middot; ${esc(assign.size)}${rec ? ` &middot; ${esc(rec.status)}` : ''}${qc ? ` &middot; QC checked ${fmtTime(qc.ts)}` : ''}</p>
+    ` : `<p class="hint" style="margin-top:6px; color:var(--warn);">Not currently assigned to any Work Order.</p>`}
+    ${state.workOrders.length ? `
+      <label style="margin-top:8px;">Work Order</label>
+      <select id="correct-wo">${woOptions}</select>
+      <div class="row">
+        <div><label>Colour</label><input type="text" id="correct-colour" value="${esc(assign ? assign.colour : '')}" placeholder="e.g. Cabernet"></div>
+        <div><label>Size</label><input type="text" id="correct-size" value="${esc(assign ? assign.size : '')}" placeholder="e.g. M"></div>
+      </div>
+      <button class="btn btn-primary" id="btn-correct-save" style="width:100%;">Save correction</button>
+    ` : `<p class="hint">No Work Orders exist yet.</p>`}
+  </div>`;
+}
+
+function saveCorrection(){
+  const serial = correctingSerial;
+  const woId = document.getElementById('correct-wo').value;
+  const colour = document.getElementById('correct-colour').value.trim();
+  const size = document.getElementById('correct-size').value.trim();
+  if(!colour || !size){ alert('Enter both colour and size.'); return; }
+  const wo = findWO(woId);
+  if(!wo) return;
+  findOrCreateSizeRow(wo, colour, size);
+  state.assignment[serial] = { woId: wo.id, woNumber: wo.woNumber, colour, size };
+  if(state.records[serial]){
+    state.records[serial] = { ...state.records[serial], woId: wo.id, woNumber: wo.woNumber, colour, size };
+  }
+  save();
+  pushAssignment(serial);
+  pushRecord(serial);
+  pushWO(wo);
+  alert('Corrected — synced to every connected device.');
+  correctingSerial = null;
+  render();
+}
+
 function bindSettingsEvents(){
   document.getElementById('file-import').onchange = handleImportFile;
   document.getElementById('file-import-assoc').onchange = handleImportAssociationReport;
   document.getElementById('file-import-targets').onchange = handleImportTargetBreakdown;
+  const correctLookupBtn = document.getElementById('btn-correct-lookup');
+  const correctInput = document.getElementById('correct-serial-input');
+  if(correctLookupBtn) correctLookupBtn.onclick = () => {
+    const val = correctInput.value.trim();
+    if(!val){ alert('Enter a serial.'); return; }
+    correctingSerial = val;
+    render();
+  };
+  if(correctInput) correctInput.addEventListener('keydown', e=>{ if(e.key==='Enter'){ correctLookupBtn.click(); }});
+  const correctSaveBtn = document.getElementById('btn-correct-save');
+  if(correctSaveBtn) correctSaveBtn.onclick = saveCorrection;
   const fbConnectBtn = document.getElementById('btn-fb-connect');
   const fbDisconnectBtn = document.getElementById('btn-fb-disconnect');
   if(fbConnectBtn) fbConnectBtn.onclick = () => {
