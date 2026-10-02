@@ -147,7 +147,8 @@ function freshState(){
     assignment: {},                    // serial -> {woId, woNumber, colour, size}
     records: {},                       // serial -> {status:'pass'|'fail', ts, size, woId, woNumber, colour, source:'scan'|'import'}  <- ASSOCIATION status
     qcChecks: {},                      // serial -> {ts, result:'pass'|'fail'}  <- physical QC check event, separate from association source
-    history: []                        // [{serial, ts, status, woNumber, size, colour, source}]
+    history: [],                       // [{serial, ts, status, woNumber, size, colour, source}]
+    lastAssign: {woId:null, colour:'', size:''}  // remembers the last manual assignment to pre-fill the next one (local-only, not synced)
   };
 }
 
@@ -169,6 +170,7 @@ function load(){
     if(!parsed.records) parsed.records = {};
     if(!parsed.qcChecks) parsed.qcChecks = {};
     if(!parsed.history) parsed.history = [];
+    if(!parsed.lastAssign) parsed.lastAssign = {woId:null, colour:'', size:''};
     return parsed;
   }catch(e){ return freshState(); }
 }
@@ -245,6 +247,35 @@ function attachSyncListeners(){
     state.qcChecks = q;
     save(); render();
   }, err=>{ syncStatus='error'; syncError=err.message; render(); });
+  // History is an append-only log that any device can add to — merge in cloud entries
+  // rather than replacing, so nothing already shown locally ever disappears.
+  db.collection('history').orderBy('ts','desc').limit(300).onSnapshot(snap=>{
+    const existingKeys = new Set(state.history.map(historyKey));
+    let added = false;
+    snap.forEach(doc=>{
+      const data = doc.data();
+      const key = historyKey(data);
+      if(!existingKeys.has(key)){
+        state.history.push(data);
+        existingKeys.add(key);
+        added = true;
+      }
+    });
+    if(added){
+      state.history.sort((a,b)=>b.ts-a.ts);
+      if(state.history.length > 300) state.history.length = 300;
+      save(); render();
+    }
+  }, err=>{ syncStatus='error'; syncError=err.message; render(); });
+}
+
+function historyKey(e){ return `${e.serial}__${e.ts}__${e.status}`; }
+function pushHistoryEntry(entry){
+  state.history.unshift(entry);
+  save();
+  if(db){
+    db.collection('history').doc(historyKey(entry)).set(entry).catch(e=>console.error('sync: push history failed', e));
+  }
 }
 
 function pushWO(wo){ if(!db || !wo) return; db.collection('workOrders').doc(wo.id).set(wo).catch(e=>console.error('sync: push WO failed', e)); }
@@ -354,6 +385,13 @@ function deleteWorkOrder(id){
 
 function findWO(woId){ return state.workOrders.find(w=>w.id===woId); }
 
+// Returns the WO's colour if every size row on it shares the same colour, else null (ambiguous).
+function getWOColourGuess(wo){
+  if(!wo || !wo.sizes.length) return null;
+  const colours = [...new Set(wo.sizes.map(s=>s.colour))];
+  return colours.length === 1 ? colours[0] : null;
+}
+
 function findOrCreateSizeRow(wo, colour, size, sku){
   let row = wo.sizes.find(s => s.colour===colour && s.size===size);
   if(!row){
@@ -434,7 +472,7 @@ function logResult(serial, status, source){
   };
   state.records[serial] = rec;
   markQcChecked(serial, status);
-  state.history.unshift({ serial, ts: rec.ts, status, woNumber: rec.woNumber, size: rec.size, colour: rec.colour, source: rec.source });
+  pushHistoryEntry({ serial, ts: rec.ts, status, woNumber: rec.woNumber, size: rec.size, colour: rec.colour, source: rec.source });
   if(!state.pool.includes(serial)) state.pool.push(serial);
   save();
   pushRecord(serial);
@@ -548,7 +586,10 @@ function renderResultPanel(serial){
   let border = 'var(--line)', body = '';
   if(!assign){
     border = 'var(--warn)';
-    const woOptions = state.workOrders.map(w=>`<option value="${w.id}">WO ${esc(w.woNumber)}</option>`).join('');
+    const defaultWO = state.workOrders.find(w=>w.id===state.lastAssign.woId) || state.workOrders[0];
+    const woOptions = state.workOrders.map(w=>`<option value="${w.id}" ${defaultWO && w.id===defaultWO.id ? 'selected':''}>WO ${esc(w.woNumber)}</option>`).join('');
+    const prefillColour = getWOColourGuess(defaultWO) || state.lastAssign.colour || '';
+    const prefillSize = state.lastAssign.size || '';
     const isUrl = currentResultRaw && /^https?:\/\//i.test(currentResultRaw);
     body = `
       <div class="result-serial">${esc(serial)}</div>
@@ -562,8 +603,8 @@ function renderResultPanel(serial){
         <label>Work Order</label>
         <select id="assign-wo">${woOptions}</select>
         <div class="row">
-          <div><label>Colour</label><input type="text" id="assign-colour" placeholder="e.g. Cabernet"></div>
-          <div><label>Size</label><input type="text" id="assign-size" placeholder="e.g. M"></div>
+          <div><label>Colour</label><input type="text" id="assign-colour" placeholder="e.g. Cabernet" value="${esc(prefillColour)}"></div>
+          <div><label>Size</label><input type="text" id="assign-size" placeholder="e.g. M" value="${esc(prefillSize)}"></div>
         </div>
         <button class="btn btn-primary" id="btn-assign" style="width:100%;">Assign &amp; continue</button>
         <button class="btn btn-fail" id="btn-confirm-notassoc" style="width:100%; margin-top:8px;">&#10005; Checked it — actually not associated, send back to line</button>
@@ -671,8 +712,17 @@ function bindResultButtons(){
     const size = document.getElementById('assign-size').value.trim();
     if(!colour || !size){ alert('Enter both colour and size.'); return; }
     assignSerialToWO(currentResultSerial, woId, colour, size);
+    state.lastAssign = {woId, colour, size};
+    save();
     document.getElementById('scan-result').innerHTML = renderResultPanel(currentResultSerial);
     bindResultButtons();
+  };
+  const assignWOSelect = document.getElementById('assign-wo');
+  if(assignWOSelect) assignWOSelect.onchange = () => {
+    const wo = findWO(assignWOSelect.value);
+    const guess = getWOColourGuess(wo);
+    const colourInput = document.getElementById('assign-colour');
+    if(guess && colourInput) colourInput.value = guess;
   };
 }
 
@@ -686,8 +736,7 @@ function showResult(serial, raw){
   const {assign, record} = lookupSerial(serial);
   if(assign && record && record.status==='pass'){
     markQcChecked(serial, 'pass');
-    state.history.unshift({ serial, ts: Date.now(), status:'pass', woNumber: assign.woNumber, size: assign.size, colour: assign.colour, source:'scan-confirm' });
-    save();
+    pushHistoryEntry({ serial, ts: Date.now(), status:'pass', woNumber: assign.woNumber, size: assign.size, colour: assign.colour, source:'scan-confirm' });
   }
   document.getElementById('scan-result').innerHTML = renderResultPanel(serial);
   bindResultButtons();
@@ -718,8 +767,7 @@ function bindConfirmedFailButtons(){
   const confirmBtn = document.getElementById('btn-confirm-fail-noserial');
   const rescanBtn = document.getElementById('btn-rescan-noserial');
   if(confirmBtn) confirmBtn.onclick = () => {
-    state.history.unshift({ serial: '(no identifier)', ts: Date.now(), status:'fail', woNumber:null, size:null, colour:null, source:'scan' });
-    save();
+    pushHistoryEntry({ serial: '(no identifier)', ts: Date.now(), status:'fail', woNumber:null, size:null, colour:null, source:'scan' });
     currentResultMode = null; currentResultRaw = null;
     render();
   };
@@ -1255,7 +1303,7 @@ function handleImportAssociationReport(e){
     try{
       const wb = XLSX.read(evt.target.result, {type:'array'});
       let created=0, updated=0, skippedNoPO=0, skippedTest=0;
-      const touchedWOs = {}, touchedAssignments = {}, touchedRecords = {};
+      const touchedWOs = {}, touchedAssignments = {}, touchedRecords = {}, touchedHistory = {};
       wb.SheetNames.forEach(name=>{
         const ws = wb.Sheets[name];
         const rows = XLSX.utils.sheet_to_json(ws, {header:1});
@@ -1292,7 +1340,9 @@ function handleImportAssociationReport(e){
           state.records[serial] = { status:'pass', ts, size, woId:wo.id, woNumber, colour, source:'import' };
           touchedRecords[serial] = state.records[serial];
           if(isNewSerial || !wasPass){
-            state.history.unshift({ serial, ts, status:'pass', woNumber, size, colour, source:'import' });
+            const histEntry = { serial, ts, status:'pass', woNumber, size, colour, source:'import' };
+            state.history.unshift(histEntry);
+            touchedHistory[historyKey(histEntry)] = histEntry;
             updated++;
           }
           if(isNewSerial) created++;
@@ -1302,6 +1352,7 @@ function handleImportAssociationReport(e){
       pushBatchDocs('workOrders', touchedWOs);
       pushBatchDocs('assignment', touchedAssignments);
       pushBatchDocs('records', touchedRecords);
+      pushBatchDocs('history', touchedHistory);
       state.lastSyncedAt = Date.now(); save();
       alert(`Import complete.\n${created} new serial(s) linked, ${updated} association record(s) written.\nSkipped: ${skippedNoPO} with no PO number, ${skippedTest} test/UAT/non-production rows.`);
       render();
