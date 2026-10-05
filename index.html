@@ -147,6 +147,7 @@ function freshState(){
     assignment: {},                    // serial -> {woId, woNumber, colour, size}
     records: {},                       // serial -> {status:'pass'|'fail', ts, size, woId, woNumber, colour, source:'scan'|'import'}  <- ASSOCIATION status
     qcChecks: {},                      // serial -> {ts, result:'pass'|'fail'}  <- physical QC check event, separate from association source
+    writtenOff: {},                    // serial -> {ts, reason:'defect'|'reference', woId, woNumber, colour, size}  <- excluded from needing association
     history: [],                       // [{serial, ts, status, woNumber, size, colour, source}]
     lastAssign: {woId:null, colour:'', size:''}  // remembers the last manual assignment to pre-fill the next one (local-only, not synced)
   };
@@ -169,14 +170,28 @@ function load(){
     if(!parsed.assignment) parsed.assignment = {};
     if(!parsed.records) parsed.records = {};
     if(!parsed.qcChecks) parsed.qcChecks = {};
+    if(!parsed.writtenOff) parsed.writtenOff = {};
     if(!parsed.history) parsed.history = [];
     if(!parsed.lastAssign) parsed.lastAssign = {woId:null, colour:'', size:''};
     return parsed;
   }catch(e){ return freshState(); }
 }
+let saveWarningShown = false;
 function save(){
-  try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }
-  catch(e){ alert("Could not save data on this device: " + e.message); }
+  try{
+    // Once connected, Firestore already holds workOrders/assignment/records/qcChecks/writtenOff
+    // durably — duplicating all of it into localStorage too is what blows the per-origin quota
+    // once a run reaches thousands of serials. Only the genuinely local-only bits still need it.
+    const toPersist = (syncStatus === 'connected')
+      ? { pool: state.pool, history: state.history, lastAssign: state.lastAssign }
+      : state;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(toPersist));
+  }catch(e){
+    if(!saveWarningShown){
+      saveWarningShown = true;
+      alert("Could not save data on this device: " + e.message + (syncStatus==='connected' ? "\n\nLive sync is still connected, so nothing is lost in the cloud — only this device's local backup copy failed." : "\n\nConnect Live sync in Settings to back this up remotely instead of relying on this device's local storage."));
+    }
+  }
 }
 
 /* ============================= LIVE SYNC (FIREBASE) — rest of the engine ============================= */
@@ -247,6 +262,16 @@ function attachSyncListeners(){
     state.qcChecks = q;
     save(); render();
   }, err=>{ syncStatus='error'; syncError=err.message; render(); });
+  db.collection('writtenOff').onSnapshot(snap=>{
+    if(snap.empty && Object.keys(state.writtenOff).length){
+      pushBatchDocs('writtenOff', state.writtenOff);
+      return;
+    }
+    const w = {};
+    snap.forEach(doc => w[doc.id] = doc.data());
+    state.writtenOff = w;
+    save(); render();
+  }, err=>{ syncStatus='error'; syncError=err.message; render(); });
   // History is an append-only log that any device can add to — merge in cloud entries
   // rather than replacing, so nothing already shown locally ever disappears.
   db.collection('history').orderBy('ts','desc').limit(300).onSnapshot(snap=>{
@@ -282,6 +307,28 @@ function pushWO(wo){ if(!db || !wo) return; db.collection('workOrders').doc(wo.i
 function pushAssignment(serial){ if(!db || !state.assignment[serial]) return; db.collection('assignment').doc(serial).set(state.assignment[serial]).catch(e=>console.error('sync: push assignment failed', e)); }
 function pushRecord(serial){ if(!db || !state.records[serial]) return; db.collection('records').doc(serial).set(state.records[serial]).catch(e=>console.error('sync: push record failed', e)); }
 function pushQcCheck(serial){ if(!db || !state.qcChecks[serial]) return; db.collection('qcChecks').doc(serial).set(state.qcChecks[serial]).catch(e=>console.error('sync: push qcCheck failed', e)); }
+function pushWrittenOff(serial){ if(!db || !state.writtenOff[serial]) return; db.collection('writtenOff').doc(serial).set(state.writtenOff[serial]).catch(e=>console.error('sync: push writtenOff failed', e)); }
+function pushWrittenOffDelete(serial){ if(!db) return; db.collection('writtenOff').doc(serial).delete().catch(e=>console.error('sync: delete writtenOff failed', e)); }
+
+function writeOffSerial(serial, reason, woId, colour, size){
+  const wo = findWO(woId);
+  let woNumber = null;
+  if(wo && colour && size){
+    findOrCreateSizeRow(wo, colour, size);
+    state.assignment[serial] = { woId: wo.id, woNumber: wo.woNumber, colour, size };
+    woNumber = wo.woNumber;
+  }
+  state.writtenOff[serial] = { ts: Date.now(), reason, woId: wo?wo.id:null, woNumber, colour: colour||null, size: size||null };
+  if(!state.pool.includes(serial)) state.pool.push(serial);
+  save();
+  pushWrittenOff(serial);
+  if(wo && colour && size){ pushAssignment(serial); pushWO(wo); }
+}
+function undoWriteOff(serial){
+  delete state.writtenOff[serial];
+  save();
+  pushWrittenOffDelete(serial);
+}
 function pushWODelete(id){ if(!db) return; db.collection('workOrders').doc(id).delete().catch(e=>console.error('sync: delete WO failed', e)); }
 
 function pushBatchDocs(collectionName, docsMap){
@@ -481,27 +528,31 @@ function logResult(serial, status, source){
 /* ============================= WO STATS / FLAGGING ============================= */
 function sizeStats(wo, sizeRow){
   const serials = serialsForSizeRow(wo, sizeRow);
-  let pass=0, fail=0;
+  let pass=0, fail=0, writtenOff=0;
   serials.forEach(s=>{
+    if(state.writtenOff[s]){ writtenOff++; return; } // written-off units are excluded from needing association at all
     const r = state.records[s];
     if(r && r.status==='pass') pass++;
     else if(r && r.status==='fail') fail++;
   });
-  const scanned = pass+fail;
+  const scanned = pass+fail+writtenOff;
   const qty = sizeRow.qty || 0;
   const targetSet = qty > 0;
-  // Flag: target is known, every expected unit has been through QC at least once, but pass count is short
-  const flagged = targetSet && (scanned >= qty) && (pass < qty);
-  return {pass, fail, scanned, qty, targetSet, flagged, count: serials.length};
+  const effectiveQty = Math.max(qty - writtenOff, 0); // units actually still expected to be associated
+  // Flag: target is known, every unit still expected has been through QC at least once, but pass count is short
+  const flagged = targetSet && ((pass+fail) >= effectiveQty) && (pass < effectiveQty);
+  return {pass, fail, writtenOff, scanned, qty, effectiveQty, targetSet, flagged, count: serials.length};
 }
 function woStats(wo){
   const sizes = wo.sizes.map(sz => ({...sz, stats: sizeStats(wo, sz)}));
   const qty = sizes.reduce((a,s)=>a+s.stats.qty,0);
   const pass = sizes.reduce((a,s)=>a+s.stats.pass,0);
   const fail = sizes.reduce((a,s)=>a+s.stats.fail,0);
+  const writtenOff = sizes.reduce((a,s)=>a+s.stats.writtenOff,0);
+  const effectiveQty = sizes.reduce((a,s)=>a+s.stats.effectiveQty,0);
   const flagged = sizes.some(s=>s.stats.flagged);
   const anyTargetSet = sizes.some(s=>s.stats.targetSet);
-  return {sizes, qty, pass, fail, flagged, anyTargetSet};
+  return {sizes, qty, pass, fail, writtenOff, effectiveQty, flagged, anyTargetSet};
 }
 
 /* ============================= RENDER: ROUTER ============================= */
@@ -597,7 +648,10 @@ function renderResultPanel(serial){
       <p class="hint" style="margin-top:10px;">${inPool ? "This serial exists but hasn't been linked to a Work Order yet." : "This serial isn't in our loaded data yet."} That doesn't necessarily mean it's unassociated — it may just be missing from an import. Double-check if you have the link, or assign it below if you know where it belongs.</p>
       ${isUrl ? `<a href="${esc(currentResultRaw)}" target="_blank" class="btn btn-ghost" style="width:100%; display:block; text-align:center; text-decoration:none; box-sizing:border-box;">Double-check this link manually</a>` : ''}
       <button class="btn btn-ghost" id="btn-rescan" style="width:100%; margin-top:8px;">Scan next</button>
-      <button id="btn-toggle-assign" style="width:100%; margin-top:14px; background:none; border:none; color:var(--ink-dim); font-size:12px; text-decoration:underline; padding:4px;">${assignFallbackOpen ? 'Hide assignment form' : 'Assign to a Work Order'}</button>
+      <div class="row" style="margin-top:14px;">
+        <button id="btn-toggle-assign" style="background:none; border:none; color:var(--ink-dim); font-size:12px; text-decoration:underline; padding:4px;">${assignFallbackOpen ? 'Hide assignment form' : 'Assign to a Work Order'}</button>
+        <button id="btn-goto-writeoff" style="background:none; border:none; color:var(--warn); font-size:12px; text-decoration:underline; padding:4px;">Quality defect / reference sample — write off</button>
+      </div>
       <div id="assign-fallback" style="display:${assignFallbackOpen ? 'block':'none'}; margin-top:8px;">
         ${state.workOrders.length ? `
         <label>Work Order</label>
@@ -706,6 +760,14 @@ function bindResultButtons(){
   if(overrideBtn) overrideBtn.onclick = () => { logResult(currentResultSerial,'fail','scan'); currentResultSerial=null; currentResultMode=null; render(); };
   if(confirmNotAssocBtn) confirmNotAssocBtn.onclick = () => { logResult(currentResultSerial,'fail','scan'); currentResultSerial=null; currentResultMode=null; render(); };
   if(toggleAssignBtn) toggleAssignBtn.onclick = () => { assignFallbackOpen = !assignFallbackOpen; document.getElementById('scan-result').innerHTML = renderResultPanel(currentResultSerial); bindResultButtons(); };
+  const gotoWriteOffBtn = document.getElementById('btn-goto-writeoff');
+  if(gotoWriteOffBtn) gotoWriteOffBtn.onclick = () => {
+    writeOffingSerial = currentResultSerial;
+    currentResultSerial = null; currentResultMode = null;
+    activeTab = 'settings';
+    [...document.querySelectorAll('#tabs button')].forEach(x=>x.classList.toggle('active', x.dataset.tab==='settings'));
+    render();
+  };
   if(assignBtn) assignBtn.onclick = () => {
     const woId = document.getElementById('assign-wo').value;
     const colour = document.getElementById('assign-colour').value.trim();
@@ -988,6 +1050,8 @@ function renderDashboard(){
   const all = state.workOrders.map(woStats);
   const totalQty = all.reduce((a,s)=>a+s.qty,0);
   const totalPass = all.reduce((a,s)=>a+s.pass,0);
+  const totalWrittenOff = all.reduce((a,s)=>a+s.writtenOff,0);
+  const totalEffectiveQty = all.reduce((a,s)=>a+s.effectiveQty,0);
   const totalFlags = all.filter(s=>s.flagged).length;
 
   let html = `<div class="card">
@@ -995,8 +1059,9 @@ function renderDashboard(){
     <div class="stat-grid">
       <div class="stat"><div class="n">${totalQty || '—'}</div><div class="l">Target units${totalQty?'':' (TBD)'}</div></div>
       <div class="stat"><div class="n" style="color:var(--pass)">${totalPass}</div><div class="l">Associated</div></div>
-      <div class="stat"><div class="n" style="color:var(--ink-dim)">${totalQty ? Math.max(totalQty-totalPass,0) : '—'}</div><div class="l">Remaining</div></div>
+      <div class="stat"><div class="n" style="color:var(--ink-dim)">${totalQty ? Math.max(totalEffectiveQty-totalPass,0) : '—'}</div><div class="l">Remaining</div></div>
     </div>
+    ${totalWrittenOff ? `<p class="hint" style="margin-top:8px; margin-bottom:0;">${totalWrittenOff} unit${totalWrittenOff>1?'s':''} written off (defect/reference) — excluded from target above.</p>` : ''}
     ${totalFlags ? `<div class="flag-banner" style="margin-top:10px;">${totalFlags} Work Order${totalFlags>1?'s':''} flagged &mdash; fully processed but association count doesn't match. See below.</div>` : ''}
   </div>`;
 
@@ -1004,26 +1069,27 @@ function renderDashboard(){
     const s = woStats(wo);
     const status = s.flagged ? '<span class="badge badge-fail">RECALL</span>'
       : (!s.anyTargetSet ? '<span class="badge badge-wo">TARGET TBD</span>'
-      : (s.pass===s.qty ? '<span class="badge badge-pass">COMPLETE</span>' : '<span class="badge badge-wo">IN PROGRESS</span>'));
+      : (s.pass===s.effectiveQty ? '<span class="badge badge-pass">COMPLETE</span>' : '<span class="badge badge-wo">IN PROGRESS</span>'));
     html += `<div class="card">
       <div class="wo-head">
         <div>
           <div class="wo-title">WO ${esc(wo.woNumber)}${wo.model ? ` <span style="color:var(--ink-dim); font-weight:500;">&middot; ${esc(wo.model)}</span>` : ''}</div>
-          <div class="wo-sub">${s.anyTargetSet ? `${s.qty} target units &middot; ` : ''}${s.pass} associated${s.fail?` &middot; ${s.fail} failed`:''}</div>
+          <div class="wo-sub">${s.anyTargetSet ? `${s.qty} target units &middot; ` : ''}${s.pass} associated${s.fail?` &middot; ${s.fail} failed`:''}${s.writtenOff?` &middot; ${s.writtenOff} written off`:''}</div>
         </div>
         ${status}
       </div>
       <table>
-        <thead><tr><th>Colour</th><th>Size</th><th>SKU</th><th>Assoc.</th><th>Target</th><th></th></tr></thead>
+        <thead><tr><th>Colour</th><th>Size</th><th>SKU</th><th>Assoc.</th><th>Written off</th><th>Target</th><th></th></tr></thead>
         <tbody>
         ${s.sizes.map(sz=>{
-          const pct = sz.stats.targetSet ? Math.round(sz.stats.pass/sz.stats.qty*100) : 0;
+          const pct = sz.stats.targetSet && sz.stats.effectiveQty ? Math.round(sz.stats.pass/sz.stats.effectiveQty*100) : 0;
           return `<tr>
             <td>${esc(sz.colour)}</td>
             <td>${esc(sz.size)}</td>
             <td style="color:var(--ink-dim);">${sz.sku ? esc(sz.sku) : '—'}</td>
             <td>${sz.stats.pass}${sz.stats.flagged ? ' <span style="color:var(--fail)">&#9888;</span>' : ''}</td>
-            <td>${sz.stats.targetSet ? sz.stats.qty : '<span class="tbd">TBD</span>'}</td>
+            <td style="color:var(--ink-dim);">${sz.stats.writtenOff || '—'}</td>
+            <td>${sz.stats.targetSet ? (sz.stats.writtenOff ? `${sz.stats.effectiveQty} <span style="color:var(--ink-dim); font-size:10.5px;">(of ${sz.stats.qty})</span>` : sz.stats.qty) : '<span class="tbd">TBD</span>'}</td>
             <td style="width:90px;">${sz.stats.targetSet ? `<div class="progress"><div style="width:${pct}%; background:${sz.stats.flagged?'var(--fail)':'var(--pass)'}"></div></div>` : ''}</td>
           </tr>`;
         }).join('')}
@@ -1040,6 +1106,7 @@ function renderFlagDetail(wo, stats){
   stats.sizes.forEach(sz=>{
     if(sz.stats.flagged){
       serialsForSizeRow(wo, sz).forEach(ser=>{
+        if(state.writtenOff[ser]) return; // excluded from target, not a missing unit
         const r = state.records[ser];
         if(!r || r.status!=='pass') missing.push({serial:ser, colour:sz.colour, size:sz.size, status: r ? r.status : 'not scanned'});
       });
@@ -1073,7 +1140,7 @@ function renderWOEditCard(wo){
     <div class="flex-between">
       <div>
         <div class="wo-title">WO ${esc(wo.woNumber)}${wo.model ? ` <span style="color:var(--ink-dim); font-weight:500;">&middot; ${esc(wo.model)}</span>` : ''}</div>
-        <div class="wo-sub">${s.anyTargetSet ? `${s.qty} target units &middot; ` : ''}${s.pass} associated so far</div>
+        <div class="wo-sub">${s.anyTargetSet ? `${s.qty} target units &middot; ` : ''}${s.pass} associated so far${s.writtenOff?` &middot; ${s.writtenOff} written off`:''}</div>
       </div>
     </div>
     <hr class="divider" style="margin:10px 0;">
@@ -1083,7 +1150,7 @@ function renderWOEditCard(wo){
       const isOpen = expandedSizeRows.has(sz.id);
       return `<div class="size-summary-row">
         <div class="ss-left">${esc(sz.colour)}${sz.sku ? ` <span style="color:var(--ink-dim); font-size:10.5px;">(${esc(sz.sku)})</span>` : ''} &middot; ${esc(sz.size)}</div>
-        <div class="ss-counts">${st.pass}${st.fail?` / ${st.fail} failed`:''} of ${sz.qty || 'TBD'}${st.flagged ? ' <span style="color:var(--fail)">&#9888;</span>' : ''}</div>
+        <div class="ss-counts">${st.pass}${st.fail?` / ${st.fail} failed`:''}${st.writtenOff?` / ${st.writtenOff} written off`:''} of ${sz.qty || 'TBD'}${st.flagged ? ' <span style="color:var(--fail)">&#9888;</span>' : ''}</div>
         <button class="btn btn-ghost btn-sm" data-toggle-serials="${sz.id}">${isOpen?'Hide':'View'} serials (${serials.length})</button>
       </div>
       ${isOpen ? renderSerialChecklist(wo, sz, serials) : ''}`;
@@ -1104,14 +1171,16 @@ function renderSerialChecklist(wo, sz, serials){
     </div>
     <div class="serial-checklist">
       <table>
-        <thead><tr><th>Serial</th><th>Associated</th><th>QC Checked</th></tr></thead>
+        <thead><tr><th>Serial</th><th>Associated</th><th>QC Checked</th><th>Written off</th></tr></thead>
         <tbody>
         ${sorted.map(ser=>{
           const rec = state.records[ser];
           const qc = state.qcChecks[ser];
+          const wOff = state.writtenOff[ser];
           const assocCell = rec && rec.status==='pass' ? '<span class="check-yes">&#10003;</span>' : (rec && rec.status==='fail' ? '<span style="color:var(--fail)">&#10005;</span>' : '<span class="check-no">—</span>');
           const qcCell = qc ? `<span class="check-yes">&#10003;</span> <span style="color:var(--ink-dim); font-size:10.5px;">${fmtTime(qc.ts)}</span>` : '<span class="check-no">—</span>';
-          return `<tr><td class="mono">${esc(ser)}</td><td>${assocCell}</td><td>${qcCell}</td></tr>`;
+          const woCell = wOff ? `<span style="color:var(--warn);">${esc(wOff.reason)}</span>` : '<span class="check-no">—</span>';
+          return `<tr><td class="mono">${esc(ser)}</td><td>${assocCell}</td><td>${qcCell}</td><td>${woCell}</td></tr>`;
         }).join('')}
         </tbody>
       </table>
@@ -1210,6 +1279,16 @@ function renderSettings(){
     <div id="correct-result">${renderCorrectResult()}</div>
   </div>
   <div class="card">
+    <h2>Write off a unit</h2>
+    <p class="hint">For units that will never be associated — quality defects pulled from the line, or reference samples. Removes the unit from its Work Order's target count instead of leaving it flagged as missing forever.</p>
+    <label>Serial</label>
+    <div class="row">
+      <input type="text" id="writeoff-serial-input" placeholder="e.g. H3Mv9W3yiq" class="mono">
+    </div>
+    <button class="btn btn-ghost" id="btn-writeoff-lookup" style="width:100%;">Look up</button>
+    <div id="writeoff-result">${renderWriteOffResult()}</div>
+  </div>
+  <div class="card">
     <h2>Serial pool</h2>
     <div class="stat-grid">
       <div class="stat"><div class="n">${total.toLocaleString()}</div><div class="l">Total loaded</div></div>
@@ -1287,6 +1366,58 @@ function saveCorrection(){
   render();
 }
 
+let writeOffingSerial = null;
+
+function renderWriteOffResult(){
+  if(!writeOffingSerial) return '';
+  const serial = writeOffingSerial;
+  const assign = state.assignment[serial];
+  const existing = state.writtenOff[serial];
+  if(existing){
+    return `<div class="wo-card" style="margin-top:10px;">
+      <div class="result-serial" style="font-size:16px;">${esc(serial)}</div>
+      <p class="hint" style="margin-top:6px; color:var(--warn);">Already written off — ${esc(existing.reason)} at ${fmtTime(existing.ts)}${existing.woNumber ? ` &middot; was WO ${esc(existing.woNumber)} ${esc(existing.colour)} ${esc(existing.size)}` : ''}.</p>
+      <button class="btn btn-fail" id="btn-undo-writeoff" style="width:100%;">Undo write-off</button>
+    </div>`;
+  }
+  const woOptions = state.workOrders.map(w=>`<option value="${w.id}" ${assign && w.id===assign.woId ? 'selected':''}>WO ${esc(w.woNumber)}</option>`).join('');
+  return `<div class="wo-card" style="margin-top:10px;">
+    <div class="result-serial" style="font-size:16px;">${esc(serial)}</div>
+    <p class="hint" style="margin-top:6px;">${assign ? `Currently: WO ${esc(assign.woNumber)} &middot; ${esc(assign.colour)} &middot; ${esc(assign.size)}` : 'Not currently assigned to a Work Order — you can still write it off, optionally tagging which WO/colour/size it came from for reporting.'}</p>
+    <label style="margin-top:8px;">Reason</label>
+    <select id="writeoff-reason">
+      <option value="Quality defect">Quality defect</option>
+      <option value="Reference sample">Reference sample</option>
+    </select>
+    ${state.workOrders.length ? `
+      <label style="margin-top:8px;">Work Order ${assign ? '' : '(optional)'}</label>
+      <select id="writeoff-wo">
+        <option value="">— none —</option>
+        ${woOptions}
+      </select>
+      <div class="row">
+        <div><label>Colour</label><input type="text" id="writeoff-colour" value="${esc(assign ? assign.colour : '')}" placeholder="e.g. Cabernet"></div>
+        <div><label>Size</label><input type="text" id="writeoff-size" value="${esc(assign ? assign.size : '')}" placeholder="e.g. M"></div>
+      </div>
+    ` : ''}
+    <button class="btn btn-fail" id="btn-writeoff-save" style="width:100%; margin-top:8px;">Write off this unit</button>
+  </div>`;
+}
+
+function saveWriteOff(){
+  const serial = writeOffingSerial;
+  const reason = document.getElementById('writeoff-reason').value;
+  const woEl = document.getElementById('writeoff-wo');
+  const woId = woEl ? woEl.value : '';
+  const colour = document.getElementById('writeoff-colour') ? document.getElementById('writeoff-colour').value.trim() : '';
+  const size = document.getElementById('writeoff-size') ? document.getElementById('writeoff-size').value.trim() : '';
+  if(woId && (!colour || !size)){ alert('If you pick a Work Order, enter both colour and size too.'); return; }
+  writeOffSerial(serial, reason, woId || null, colour, size);
+  alert('Written off — synced to every connected device.');
+  writeOffingSerial = null;
+  render();
+}
+
 function bindSettingsEvents(){
   document.getElementById('file-import').onchange = handleImportFile;
   document.getElementById('file-import-assoc').onchange = handleImportAssociationReport;
@@ -1302,6 +1433,23 @@ function bindSettingsEvents(){
   if(correctInput) correctInput.addEventListener('keydown', e=>{ if(e.key==='Enter'){ correctLookupBtn.click(); }});
   const correctSaveBtn = document.getElementById('btn-correct-save');
   if(correctSaveBtn) correctSaveBtn.onclick = saveCorrection;
+  const writeOffLookupBtn = document.getElementById('btn-writeoff-lookup');
+  const writeOffInput = document.getElementById('writeoff-serial-input');
+  if(writeOffLookupBtn) writeOffLookupBtn.onclick = () => {
+    const val = writeOffInput.value.trim();
+    if(!val){ alert('Enter a serial.'); return; }
+    writeOffingSerial = val;
+    render();
+  };
+  if(writeOffInput) writeOffInput.addEventListener('keydown', e=>{ if(e.key==='Enter'){ writeOffLookupBtn.click(); }});
+  const writeOffSaveBtn = document.getElementById('btn-writeoff-save');
+  if(writeOffSaveBtn) writeOffSaveBtn.onclick = saveWriteOff;
+  const undoWriteOffBtn = document.getElementById('btn-undo-writeoff');
+  if(undoWriteOffBtn) undoWriteOffBtn.onclick = () => {
+    undoWriteOff(writeOffingSerial);
+    writeOffingSerial = null;
+    render();
+  };
   const fbConnectBtn = document.getElementById('btn-fb-connect');
   const fbDisconnectBtn = document.getElementById('btn-fb-disconnect');
   if(fbConnectBtn) fbConnectBtn.onclick = () => {
