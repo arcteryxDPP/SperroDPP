@@ -503,10 +503,17 @@ function findOrCreateSizeRow(wo, colour, size, sku){
   return row;
 }
 
+// A WO's id is always derived from its own woNumber, never random — so two code paths (or two
+// page loads racing before Firestore sync settles) that both try to create the same WO always
+// collide into the same document instead of producing a duplicate.
+function woDocId(woNumber){
+  return 'wo_' + String(woNumber).trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
 function findOrCreateWO(woNumber, model, season){
   let wo = state.workOrders.find(w=>w.woNumber===woNumber);
   if(!wo){
-    wo = { id: uid(), woNumber, model: model||null, season: season||null, createdAt: Date.now(), sizes: [] };
+    wo = { id: woDocId(woNumber), woNumber, model: model||null, season: season||null, createdAt: Date.now(), sizes: [] };
     state.workOrders.push(wo);
   } else {
     if(model && !wo.model) wo.model = model;
@@ -524,7 +531,7 @@ function seedDefaultTargets(){
     if(state.workOrders.some(w=>w.woNumber===t.woNumber)) return;
     // Deterministic ID (not a random uid()) — re-seeding always upserts the same document
     // instead of creating a fresh duplicate every time this runs against an empty local cache.
-    const wo = { id: 'seed_'+t.woNumber, woNumber: t.woNumber, model: t.model||null, season: t.season||null, createdAt: Date.now(), sizes: [] };
+    const wo = { id: woDocId(t.woNumber), woNumber: t.woNumber, model: t.model||null, season: t.season||null, createdAt: Date.now(), sizes: [] };
     t.sizes.forEach(sz=>{
       wo.sizes.push({ id: uid(), colour: sz.colour, size: sz.size, qty: sz.qty||0, sku: sz.sku||null });
     });
