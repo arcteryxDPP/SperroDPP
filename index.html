@@ -416,6 +416,59 @@ function createWorkOrder(woNumber, rows){
   return true;
 }
 
+// Merges Work Orders that share the same woNumber but ended up with different ids (e.g. from
+// repeated re-seeding before IDs were made deterministic). Keeps the oldest as canonical, moves
+// any assignment/record pointing at a duplicate over to it, merges size rows, then removes the dupes.
+function cleanupDuplicateWorkOrders(){
+  const byNumber = {};
+  state.workOrders.forEach(wo=>{ (byNumber[wo.woNumber] = byNumber[wo.woNumber] || []).push(wo); });
+  const dupGroups = Object.values(byNumber).filter(g=>g.length>1);
+  if(!dupGroups.length){ alert('No duplicate Work Orders found.'); return; }
+
+  let mergedCount = 0, reassigned = 0;
+  dupGroups.forEach(group=>{
+    group.sort((a,b)=>(a.createdAt||0)-(b.createdAt||0));
+    const canonical = group[0];
+    const dupes = group.slice(1);
+    dupes.forEach(dup=>{
+      if(!canonical.model && dup.model) canonical.model = dup.model;
+      if(!canonical.season && dup.season) canonical.season = dup.season;
+      dup.sizes.forEach(dsz=>{
+        const existing = canonical.sizes.find(s=>s.colour===dsz.colour && s.size===dsz.size);
+        if(existing){
+          if(dsz.qty > existing.qty) existing.qty = dsz.qty;
+          if(!existing.sku && dsz.sku) existing.sku = dsz.sku;
+        } else {
+          canonical.sizes.push({...dsz});
+        }
+      });
+      Object.keys(state.assignment).forEach(serial=>{
+        if(state.assignment[serial].woId === dup.id){
+          state.assignment[serial].woId = canonical.id;
+          pushAssignment(serial);
+          reassigned++;
+        }
+      });
+      Object.keys(state.records).forEach(serial=>{
+        if(state.records[serial].woId === dup.id){
+          state.records[serial].woId = canonical.id;
+          pushRecord(serial);
+        }
+      });
+      Object.keys(state.writtenOff).forEach(serial=>{
+        if(state.writtenOff[serial].woId === dup.id) state.writtenOff[serial].woId = canonical.id;
+      });
+      state.workOrders = state.workOrders.filter(w=>w.id!==dup.id);
+      pushWODelete(dup.id);
+      mergedCount++;
+    });
+    pushWO(canonical);
+  });
+  save();
+  alert(`Merged ${mergedCount} duplicate Work Order(s) across ${dupGroups.length} WO number(s). Reassigned ${reassigned} serial(s) in the process.`);
+  render();
+}
+
 function deleteWorkOrder(id){
   const wo = state.workOrders.find(w=>w.id===id);
   if(!wo) return;
@@ -469,7 +522,9 @@ function seedDefaultTargets(){
   let added = 0;
   DEFAULT_TARGET_WORK_ORDERS.forEach(t=>{
     if(state.workOrders.some(w=>w.woNumber===t.woNumber)) return;
-    const wo = { id: uid(), woNumber: t.woNumber, model: t.model||null, season: t.season||null, createdAt: Date.now(), sizes: [] };
+    // Deterministic ID (not a random uid()) — re-seeding always upserts the same document
+    // instead of creating a fresh duplicate every time this runs against an empty local cache.
+    const wo = { id: 'seed_'+t.woNumber, woNumber: t.woNumber, model: t.model||null, season: t.season||null, createdAt: Date.now(), sizes: [] };
     t.sizes.forEach(sz=>{
       wo.sizes.push({ id: uid(), colour: sz.colour, size: sz.size, qty: sz.qty||0, sku: sz.sku||null });
     });
@@ -1240,18 +1295,45 @@ function bindWorkOrderEvents(){
 
 /* ============================= LOG TAB ============================= */
 let logFilter = '';
+let logSort = {col:'ts', dir:'desc'};
+const LOG_SORT_COLS = {
+  serial: h => h.serial || '',
+  wo: h => h.woNumber || '',
+  size: h => `${h.colour||''} ${h.size||''}`,
+  status: h => h.status || '',
+  source: h => h.source || '',
+  ts: h => h.ts || 0
+};
+function logSortHeader(col, label, align){
+  const active = logSort.col === col;
+  const arrow = active ? (logSort.dir==='asc' ? ' &#9650;' : ' &#9660;') : '';
+  return `<th data-sort-col="${col}" style="cursor:pointer; user-select:none; ${align?'text-align:'+align+';':''}">${esc(label)}${arrow}</th>`;
+}
 function renderLog(){
   const term = logFilter.toLowerCase();
-  const rows = state.history.filter(h =>
+  let rows = state.history.filter(h =>
     !term || h.serial.toLowerCase().includes(term) || (h.woNumber||'').toLowerCase().includes(term)
   );
+  const getKey = LOG_SORT_COLS[logSort.col] || LOG_SORT_COLS.ts;
+  rows = rows.slice().sort((a,b)=>{
+    const ka = getKey(a), kb = getKey(b);
+    const cmp = typeof ka === 'number' ? ka-kb : String(ka).localeCompare(String(kb));
+    return logSort.dir === 'asc' ? cmp : -cmp;
+  });
   return `<div class="card">
     <h2>Scan log</h2>
     <input type="text" id="log-search" class="search-box" placeholder="Filter by serial or WO number" value="${esc(logFilter)}">
     <div class="row" style="margin-bottom:10px;">
       <button class="btn btn-ghost" id="btn-export-csv">Export CSV</button>
     </div>
-    ${rows.length ? `<table><thead><tr><th>Serial</th><th>WO</th><th>Colour/Size</th><th>Result</th><th>Src</th><th style="text-align:right">Time</th></tr></thead>
+    ${rows.length ? `<table><thead><tr>
+      ${logSortHeader('serial','Serial')}
+      ${logSortHeader('wo','WO')}
+      ${logSortHeader('size','Colour/Size')}
+      ${logSortHeader('status','Result')}
+      ${logSortHeader('source','Src')}
+      ${logSortHeader('ts','Time','right')}
+    </tr></thead>
     <tbody>${rows.map(h=>`
       <tr>
         <td class="mono">${esc(h.serial)}</td>
@@ -1266,6 +1348,14 @@ function renderLog(){
 function bindLogEvents(){
   document.getElementById('log-search').oninput = (e)=>{ logFilter = e.target.value; render(); document.getElementById('log-search').focus(); };
   document.getElementById('btn-export-csv').onclick = exportCSV;
+  document.querySelectorAll('[data-sort-col]').forEach(th=>{
+    th.onclick = () => {
+      const col = th.dataset.sortCol;
+      if(logSort.col === col) logSort.dir = logSort.dir==='asc' ? 'desc' : 'asc';
+      else logSort = {col, dir: col==='ts' ? 'desc' : 'asc'};
+      render();
+    };
+  });
 }
 function exportCSV(){
   const header = ['serial','work_order','colour','size','result','source','timestamp'];
@@ -1319,6 +1409,11 @@ function renderSettings(){
     </div>
     <button class="btn btn-ghost" id="btn-writeoff-lookup" style="width:100%;">Look up</button>
     <div id="writeoff-result">${renderWriteOffResult()}</div>
+  </div>
+  <div class="card">
+    <h2>Clean up duplicate Work Orders</h2>
+    <p class="hint">Merges any Work Orders that share the same WO number but ended up as separate entries (a known bug from re-seeding that's now fixed going forward). Safe to run any time — it moves any associated serials onto the surviving entry rather than losing them.</p>
+    <button class="btn btn-fail" id="btn-cleanup-dupes" style="width:100%;">Find and merge duplicates</button>
   </div>
   <div class="card">
     <h2>Tag Work Orders by season</h2>
@@ -1490,6 +1585,10 @@ function bindSettingsEvents(){
     undoWriteOff(writeOffingSerial);
     writeOffingSerial = null;
     render();
+  };
+  const cleanupBtn = document.getElementById('btn-cleanup-dupes');
+  if(cleanupBtn) cleanupBtn.onclick = () => {
+    if(confirm('Scan for and merge duplicate Work Orders now?')) cleanupDuplicateWorkOrders();
   };
   const applySeasonBtn = document.getElementById('btn-apply-season');
   if(applySeasonBtn) applySeasonBtn.onclick = () => {
