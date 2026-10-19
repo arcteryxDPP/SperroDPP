@@ -702,7 +702,7 @@ function renderResultPanel(serial){
   if(!assign){
     border = 'var(--warn)';
     const defaultWO = state.workOrders.find(w=>w.id===state.lastAssign.woId) || state.workOrders[0];
-    const woOptions = state.workOrders.map(w=>`<option value="${w.id}" ${defaultWO && w.id===defaultWO.id ? 'selected':''}>WO ${esc(w.woNumber)}</option>`).join('');
+    const woOptions = sortWOs(state.workOrders).map(w=>`<option value="${w.id}" ${defaultWO && w.id===defaultWO.id ? 'selected':''}>WO ${esc(w.woNumber)}</option>`).join('');
     const prefillColour = getWOColourGuess(defaultWO) || state.lastAssign.colour || '';
     const prefillSize = state.lastAssign.size || '';
     const isUrl = currentResultRaw && /^https?:\/\//i.test(currentResultRaw);
@@ -1123,9 +1123,18 @@ function renderSeasonFilter(idPrefix){
     <select id="${idPrefix}-season-filter">${options.join('')}</select>
   </div>`;
 }
+// Numeric-aware WO sort — "84063" sorts before "84077", and before "830000" etc.,
+// rather than a plain string sort which can misorder numbers of different lengths.
+function sortWOs(list){
+  return list.slice().sort((a,b)=>{
+    const na = parseInt(a.woNumber,10), nb = parseInt(b.woNumber,10);
+    if(!isNaN(na) && !isNaN(nb) && na!==nb) return na-nb;
+    return String(a.woNumber).localeCompare(String(b.woNumber));
+  });
+}
 function filteredWorkOrders(){
-  if(seasonFilter === 'all') return state.workOrders;
-  return state.workOrders.filter(w => (w.season || 'Unlabeled') === seasonFilter);
+  const scoped = seasonFilter === 'all' ? state.workOrders : state.workOrders.filter(w => (w.season || 'Unlabeled') === seasonFilter);
+  return sortWOs(scoped);
 }
 
 function renderDashboard(){
@@ -1469,7 +1478,7 @@ function renderCorrectResult(){
   const assign = state.assignment[serial];
   const rec = state.records[serial];
   const qc = state.qcChecks[serial];
-  const woOptions = state.workOrders.map(w=>`<option value="${w.id}" ${assign && w.id===assign.woId ? 'selected':''}>WO ${esc(w.woNumber)}</option>`).join('');
+  const woOptions = sortWOs(state.workOrders).map(w=>`<option value="${w.id}" ${assign && w.id===assign.woId ? 'selected':''}>WO ${esc(w.woNumber)}</option>`).join('');
   return `<div class="wo-card" style="margin-top:10px;">
     <div class="result-serial" style="font-size:16px;">${esc(serial)}</div>
     ${assign ? `
@@ -1523,7 +1532,7 @@ function renderWriteOffResult(){
       <button class="btn btn-fail" id="btn-undo-writeoff" style="width:100%;">Undo write-off</button>
     </div>`;
   }
-  const woOptions = state.workOrders.map(w=>`<option value="${w.id}" ${assign && w.id===assign.woId ? 'selected':''}>WO ${esc(w.woNumber)}</option>`).join('');
+  const woOptions = sortWOs(state.workOrders).map(w=>`<option value="${w.id}" ${assign && w.id===assign.woId ? 'selected':''}>WO ${esc(w.woNumber)}</option>`).join('');
   return `<div class="wo-card" style="margin-top:10px;">
     <div class="result-serial" style="font-size:16px;">${esc(serial)}</div>
     <p class="hint" style="margin-top:6px;">${assign ? `Currently: WO ${esc(assign.woNumber)} &middot; ${esc(assign.colour)} &middot; ${esc(assign.size)}` : 'Not currently assigned to a Work Order — you can still write it off, optionally tagging which WO/colour/size it came from for reporting.'}</p>
