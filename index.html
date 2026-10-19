@@ -1696,6 +1696,10 @@ function handleImportAssociationReport(e){
         const cNonProdIdxs = header.map((h,i)=> String(h||'').trim().toLowerCase()==='field.nonproduction' ? i : -1).filter(i=>i>-1);
         const cCreated = colIdx(header,'CreatedTime');
         if(cId===-1 || cPO===-1 || cSize===-1 || cColor===-1) return; // not this report format on this sheet
+        // First pass: resolve rows per serial. The same serial can legitimately appear more
+        // than once in one export (e.g. a stale prior association alongside the current one) —
+        // the row with the latest CreatedTime wins, not just whichever comes last in the file.
+        const bestRowForSerial = {};
         for(let i=1;i<rows.length;i++){
           const row = rows[i];
           const serial = row[cId] ? String(row[cId]).trim() : '';
@@ -1708,7 +1712,12 @@ function handleImportAssociationReport(e){
           const colour = row[cColor] ? String(row[cColor]).trim() : '(no colour)';
           const size = row[cSize] ? String(row[cSize]).trim() : '(no size)';
           const ts = cCreated>-1 && row[cCreated] ? (Date.parse(row[cCreated]) || Date.now()) : Date.now();
-
+          const candidate = { serial, woNumber, colour, size, ts };
+          const existing = bestRowForSerial[serial];
+          if(!existing || ts >= existing.ts) bestRowForSerial[serial] = candidate;
+        }
+        // Second pass: apply only the winning row per serial.
+        Object.values(bestRowForSerial).forEach(({serial, woNumber, colour, size, ts})=>{
           const wo = findOrCreateWO(woNumber);
           findOrCreateSizeRow(wo, colour, size);
           touchedWOs[wo.id] = wo;
@@ -1726,7 +1735,7 @@ function handleImportAssociationReport(e){
             updated++;
           }
           if(isNewSerial) created++;
-        }
+        });
       });
       save();
       pushBatchDocs('workOrders', touchedWOs);
