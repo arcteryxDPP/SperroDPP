@@ -149,13 +149,17 @@ function freshState(){
     qcChecks: {},                      // serial -> {ts, result:'pass'|'fail'}  <- physical QC check event, separate from association source
     writtenOff: {},                    // serial -> {ts, reason:'defect'|'reference', woId, woNumber, colour, size}  <- excluded from needing association
     history: [],                       // [{serial, ts, status, woNumber, size, colour, source}]
-    lastAssign: {woId:null, colour:'', size:''}  // remembers the last manual assignment to pre-fill the next one (local-only, not synced)
+    lastAssign: {woId:null, colour:'', size:''},  // remembers the last manual assignment to pre-fill the next one (local-only, not synced)
+    facilityFilter: '',                // when set, association-report import only keeps rows from this ManufacturingFacility (local-only, not synced)
+    minImportDate: '2026-08-01'        // YYYY-MM-DD — association-report rows with an earlier CreatedTime are skipped (local-only, not synced)
   };
 }
 
 /* ============================= LIVE SYNC (FIREBASE) — declared early so init below can use it ============================= */
 const FB_CONFIG_KEY = "arc_dpp_fb_config";
 let db = null, syncStatus = 'disconnected', syncError = null, syncListenersAttached = false;
+const HISTORY_SYNC_LIMIT = 1000;
+let locallyPushedHistoryKeys = new Set(); // entries this device has logged this session — never truncated away locally
 
 let state = load();
 seedDefaultTargets();
@@ -173,6 +177,8 @@ function load(){
     if(!parsed.writtenOff) parsed.writtenOff = {};
     if(!parsed.history) parsed.history = [];
     if(!parsed.lastAssign) parsed.lastAssign = {woId:null, colour:'', size:''};
+    if(parsed.facilityFilter === undefined) parsed.facilityFilter = '';
+    if(parsed.minImportDate === undefined) parsed.minImportDate = '2026-08-01';
     return parsed;
   }catch(e){ return freshState(); }
 }
@@ -183,7 +189,7 @@ function save(){
     // durably — duplicating all of it into localStorage too is what blows the per-origin quota
     // once a run reaches thousands of serials. Only the genuinely local-only bits still need it.
     const toPersist = (syncStatus === 'connected')
-      ? { pool: state.pool, history: state.history, lastAssign: state.lastAssign }
+      ? { pool: state.pool, history: state.history, lastAssign: state.lastAssign, facilityFilter: state.facilityFilter, minImportDate: state.minImportDate }
       : state;
     localStorage.setItem(STORAGE_KEY, JSON.stringify(toPersist));
   }catch(e){
@@ -210,12 +216,26 @@ function initFirebaseSync(config){
   try{
     if(!firebase.apps || !firebase.apps.length) firebase.initializeApp(config);
     db = firebase.firestore();
-    attachSyncListeners();
-    syncStatus = 'connected'; syncError = null;
+    const startListening = () => {
+      attachSyncListeners();
+      syncStatus = 'connected'; syncError = null;
+      render();
+    };
+    if(db.enablePersistence){
+      // Caches data in IndexedDB across sessions — repeat opens serve from local cache
+      // instantly and only sync the delta, instead of re-downloading the whole collection
+      // over the network every single time. Purely an optimization; safe to ignore if it fails
+      // (e.g. multiple tabs open, or the browser doesn't support it).
+      db.enablePersistence({synchronizeTabs:true})
+        .catch(e=>{ console.warn('Firestore offline persistence unavailable:', e.code||e.message); })
+        .then(startListening);
+    } else {
+      startListening();
+    }
   }catch(e){
     db = null; syncStatus = 'error'; syncError = e.message;
+    render();
   }
-  render();
 }
 
 function attachSyncListeners(){
@@ -274,7 +294,7 @@ function attachSyncListeners(){
   }, err=>{ syncStatus='error'; syncError=err.message; render(); });
   // History is an append-only log that any device can add to — merge in cloud entries
   // rather than replacing, so nothing already shown locally ever disappears.
-  db.collection('history').orderBy('ts','desc').limit(300).onSnapshot(snap=>{
+  db.collection('history').orderBy('ts','desc').limit(HISTORY_SYNC_LIMIT).onSnapshot(snap=>{
     const existingKeys = new Set(state.history.map(historyKey));
     let added = false;
     snap.forEach(doc=>{
@@ -288,7 +308,16 @@ function attachSyncListeners(){
     });
     if(added){
       state.history.sort((a,b)=>b.ts-a.ts);
-      if(state.history.length > 300) state.history.length = 300;
+      if(state.history.length > HISTORY_SYNC_LIMIT){
+        // Never let a merge/trim silently drop something THIS device logged this session —
+        // bulk import volume (which can carry thousands of recent-looking timestamps) shouldn't
+        // be able to crowd a live scan out of view on the device that just made it.
+        const preserved = state.history.filter(h => locallyPushedHistoryKeys.has(historyKey(h)));
+        const rest = state.history.filter(h => !locallyPushedHistoryKeys.has(historyKey(h)));
+        const keep = Math.max(HISTORY_SYNC_LIMIT - preserved.length, 0);
+        state.history = preserved.concat(rest.slice(0, keep));
+        state.history.sort((a,b)=>b.ts-a.ts);
+      }
       save(); render();
     }
   }, err=>{ syncStatus='error'; syncError=err.message; render(); });
@@ -296,10 +325,12 @@ function attachSyncListeners(){
 
 function historyKey(e){ return `${e.serial}__${e.ts}__${e.status}`; }
 function pushHistoryEntry(entry){
+  const key = historyKey(entry);
+  locallyPushedHistoryKeys.add(key);
   state.history.unshift(entry);
   save();
   if(db){
-    db.collection('history').doc(historyKey(entry)).set(entry).catch(e=>console.error('sync: push history failed', e));
+    db.collection('history').doc(key).set(entry).catch(e=>console.error('sync: push history failed', e));
   }
 }
 
@@ -330,6 +361,9 @@ function undoWriteOff(serial){
   pushWrittenOffDelete(serial);
 }
 function pushWODelete(id){ if(!db) return; db.collection('workOrders').doc(id).delete().catch(e=>console.error('sync: delete WO failed', e)); }
+function pushAssignmentDelete(serial){ if(!db) return; db.collection('assignment').doc(serial).delete().catch(e=>console.error('sync: delete assignment failed', e)); }
+function pushRecordDelete(serial){ if(!db) return; db.collection('records').doc(serial).delete().catch(e=>console.error('sync: delete record failed', e)); }
+function pushQcCheckDelete(serial){ if(!db) return; db.collection('qcChecks').doc(serial).delete().catch(e=>console.error('sync: delete qcCheck failed', e)); }
 
 function pushBatchDocs(collectionName, docsMap){
   if(!db) return;
@@ -469,12 +503,46 @@ function cleanupDuplicateWorkOrders(){
   render();
 }
 
+// Removes every Work Order whose season matches one of the given labels (e.g. 'Unlabeled', 'F26'),
+// along with any assignment/record/QC-check/write-off data tied to serials on those WOs.
+// History is left untouched — it's an audit log, not something retroactively rewritten.
+function removeWorkOrdersBySeasons(seasonLabels){
+  const labelSet = new Set(seasonLabels.map(s=>s.toLowerCase()));
+  const toRemove = state.workOrders.filter(w => labelSet.has((w.season || 'Unlabeled').toLowerCase()));
+  if(!toRemove.length){ alert('No Work Orders matched those season labels.'); return; }
+  const totalUnits = toRemove.reduce((a,w)=>a + w.sizes.reduce((b,s)=>b+(s.qty||0),0), 0);
+  if(!confirm(`Remove ${toRemove.length} Work Order(s) (${toRemove.map(w=>w.woNumber).join(', ')}), totaling ${totalUnits} target units, plus every serial linked to them? This cannot be undone.`)) return;
+  let serialsCleared = 0;
+  toRemove.forEach(wo=>{
+    Object.keys(state.assignment).forEach(s=>{
+      if(state.assignment[s].woId === wo.id){
+        delete state.assignment[s]; pushAssignmentDelete(s);
+        if(state.records[s]){ delete state.records[s]; pushRecordDelete(s); }
+        if(state.qcChecks[s]){ delete state.qcChecks[s]; pushQcCheckDelete(s); }
+        if(state.writtenOff[s]){ delete state.writtenOff[s]; pushWrittenOffDelete(s); }
+        serialsCleared++;
+      }
+    });
+    pushWODelete(wo.id);
+  });
+  const removeIds = new Set(toRemove.map(w=>w.id));
+  state.workOrders = state.workOrders.filter(w=>!removeIds.has(w.id));
+  save();
+  alert(`Removed ${toRemove.length} Work Order(s) and cleared ${serialsCleared} linked serial(s).`);
+  render();
+}
+
 function deleteWorkOrder(id){
   const wo = state.workOrders.find(w=>w.id===id);
   if(!wo) return;
   if(!confirm(`Delete Work Order ${wo.woNumber}? This clears the assignment and scan records for any serials linked to it. This cannot be undone.`)) return;
   Object.keys(state.assignment).forEach(s=>{
-    if(state.assignment[s].woId === id){ delete state.assignment[s]; delete state.records[s]; }
+    if(state.assignment[s].woId === id){
+      delete state.assignment[s]; pushAssignmentDelete(s);
+      if(state.records[s]){ delete state.records[s]; pushRecordDelete(s); }
+      if(state.qcChecks[s]){ delete state.qcChecks[s]; pushQcCheckDelete(s); }
+      if(state.writtenOff[s]){ delete state.writtenOff[s]; pushWrittenOffDelete(s); }
+    }
   });
   state.workOrders = state.workOrders.filter(w=>w.id!==id);
   state.history = state.history.filter(h => h.woId !== id);
@@ -864,10 +932,39 @@ function showResult(serial, raw){
   if(assign && record && record.status==='pass'){
     markQcChecked(serial, 'pass');
     pushHistoryEntry({ serial, ts: Date.now(), status:'pass', woNumber: assign.woNumber, size: assign.size, colour: assign.colour, source:'scan-confirm' });
+  } else if(!assign && db){
+    // The bulk collection listener can still be mid-download on a large dataset — a serial
+    // that looks unrecognized locally may already exist in Firestore. Check it directly
+    // rather than waiting for the whole collection to finish syncing.
+    doubleCheckRemoteAssignment(serial);
   }
   document.getElementById('scan-result').innerHTML = renderResultPanel(serial);
   bindResultButtons();
   document.getElementById('manual-input') && (document.getElementById('manual-input').value = '');
+}
+
+async function doubleCheckRemoteAssignment(serial){
+  try{
+    const [aSnap, rSnap, qSnap, wSnap] = await Promise.all([
+      db.collection('assignment').doc(serial).get(),
+      db.collection('records').doc(serial).get(),
+      db.collection('qcChecks').doc(serial).get(),
+      db.collection('writtenOff').doc(serial).get()
+    ]);
+    let changed = false;
+    if(aSnap.exists && !state.assignment[serial]){ state.assignment[serial] = aSnap.data(); changed = true; }
+    if(rSnap.exists && !state.records[serial]){ state.records[serial] = rSnap.data(); changed = true; }
+    if(qSnap.exists && !state.qcChecks[serial]){ state.qcChecks[serial] = qSnap.data(); changed = true; }
+    if(wSnap.exists && !state.writtenOff[serial]){ state.writtenOff[serial] = wSnap.data(); changed = true; }
+    if(changed){
+      save();
+      // Only touch the screen if the person is still looking at this same serial's result.
+      if(currentResultMode==='result' && currentResultSerial===serial){
+        document.getElementById('scan-result').innerHTML = renderResultPanel(serial);
+        bindResultButtons();
+      }
+    }
+  }catch(e){ console.error('direct serial double-check failed', e); }
 }
 
 function showConfirmedFail(raw){
@@ -1441,6 +1538,12 @@ function renderSettings(){
     <button class="btn btn-primary" id="btn-apply-season" style="width:100%;">Apply label</button>
   </div>
   <div class="card">
+    <h2>Remove pre-S27 Work Orders</h2>
+    <p class="hint">Permanently removes every Work Order tagged <span class="mono">Unlabeled</span> or <span class="mono">F26</span>, along with every serial linked to them. Use this once the process is fully on S/2027 and older data no longer has value. This cannot be undone.</p>
+    <p class="hint" style="margin-top:-6px;">Currently: <strong>${state.workOrders.filter(w=>(w.season||'Unlabeled')==='Unlabeled').length}</strong> Unlabeled, <strong>${state.workOrders.filter(w=>(w.season||'Unlabeled').toLowerCase()==='f26').length}</strong> F26.</p>
+    <button class="btn btn-fail" id="btn-remove-old-seasons" style="width:100%;">Remove Unlabeled + F26 Work Orders</button>
+  </div>
+  <div class="card">
     <h2>Serial pool</h2>
     <div class="stat-grid">
       <div class="stat"><div class="n">${total.toLocaleString()}</div><div class="l">Total loaded</div></div>
@@ -1456,6 +1559,12 @@ function renderSettings(){
   <div class="card">
     <h2>Import association report</h2>
     <p class="hint">Upload a DPP system export (columns like <span class="mono">Identifier1</span>, <span class="mono">PONumber</span>, <span class="mono">Product.Size</span>, <span class="mono">Product.Color</span>). Each row is treated as a confirmed association: it creates the Work Order if needed, adds the colour/size line, links the serial, and marks it Pass. Rows with no PO number, marked <span class="mono">Nonproduction</span>, or with a PO containing "UAT" are skipped automatically. Safe to re-run whenever you pull a fresh export.</p>
+    <label>Manufacturing facility filter (optional)</label>
+    <input type="text" id="facility-filter-input" placeholder="e.g. Arc'One" value="${esc(state.facilityFilter||'')}">
+    <p class="hint" style="margin-top:-6px;">When set, only rows whose <span class="mono">Product.ManufacturingFacility</span> column exactly matches this (case-insensitive) are imported — everything else is skipped. Type it exactly as it appears in your export. Leave blank to import all facilities.</p>
+    <label>Only import rows on or after (optional)</label>
+    <input type="date" id="min-import-date-input" value="${esc(state.minImportDate||'')}">
+    <p class="hint" style="margin-top:-6px;">Rows with a <span class="mono">CreatedTime</span> before this date are skipped — useful for excluding pre-S27 data. Rows with no CreatedTime at all are still imported (there's nothing to filter on). Clear the date to stop filtering by date.</p>
     <input type="file" id="file-import-assoc" accept=".xlsx,.xls,.csv">
   </div>
   <div class="card">
@@ -1573,6 +1682,10 @@ function saveWriteOff(){
 function bindSettingsEvents(){
   document.getElementById('file-import').onchange = handleImportFile;
   document.getElementById('file-import-assoc').onchange = handleImportAssociationReport;
+  const facilityInput = document.getElementById('facility-filter-input');
+  if(facilityInput) facilityInput.onchange = () => { state.facilityFilter = facilityInput.value.trim(); save(); };
+  const minDateInput = document.getElementById('min-import-date-input');
+  if(minDateInput) minDateInput.onchange = () => { state.minImportDate = minDateInput.value; save(); };
   document.getElementById('file-import-targets').onchange = handleImportTargetBreakdown;
   const correctLookupBtn = document.getElementById('btn-correct-lookup');
   const correctInput = document.getElementById('correct-serial-input');
@@ -1622,6 +1735,8 @@ function bindSettingsEvents(){
     alert(`Tagged ${matched} of ${woNumbers.length} Work Order(s) as "${label}". ${woNumbers.length-matched} weren't found.`);
     render();
   };
+  const removeOldSeasonsBtn = document.getElementById('btn-remove-old-seasons');
+  if(removeOldSeasonsBtn) removeOldSeasonsBtn.onclick = () => removeWorkOrdersBySeasons(['Unlabeled','F26']);
   const fbConnectBtn = document.getElementById('btn-fb-connect');
   const fbDisconnectBtn = document.getElementById('btn-fb-disconnect');
   if(fbConnectBtn) fbConnectBtn.onclick = () => {
@@ -1691,7 +1806,9 @@ function handleImportAssociationReport(e){
   reader.onload = (evt) => {
     try{
       const wb = XLSX.read(evt.target.result, {type:'array'});
-      let created=0, updated=0, skippedNoPO=0, skippedTest=0;
+      let created=0, updated=0, skippedNoPO=0, skippedTest=0, skippedFacility=0, skippedOldDate=0;
+      const facilityFilter = (state.facilityFilter||'').trim().toLowerCase();
+      const minImportTs = state.minImportDate ? Date.parse(state.minImportDate + 'T00:00:00') : null;
       const touchedWOs = {}, touchedAssignments = {}, touchedRecords = {}, touchedHistory = {};
       wb.SheetNames.forEach(name=>{
         const ws = wb.Sheets[name];
@@ -1701,6 +1818,7 @@ function handleImportAssociationReport(e){
         const cPO = colIdx(header,'PONumber');
         const cSize = colIdx(header,'Product.Size');
         const cColor = colIdx(header,'Product.Color');
+        const cFacility = colIdx(header,'Product.ManufacturingFacility');
         // the source system exports two differently-cased nonproduction columns; check both
         const cNonProdIdxs = header.map((h,i)=> String(h||'').trim().toLowerCase()==='field.nonproduction' ? i : -1).filter(i=>i>-1);
         const cCreated = colIdx(header,'CreatedTime');
@@ -1717,10 +1835,17 @@ function handleImportAssociationReport(e){
           if(!serial) continue;
           if(po===undefined || po===null || String(po).trim()===''){ skippedNoPO++; continue; }
           if(String(po).toLowerCase().includes('uat') || nonProd){ skippedTest++; continue; }
+          if(facilityFilter && cFacility>-1){
+            const facility = row[cFacility] ? String(row[cFacility]).trim().toLowerCase() : '';
+            if(facility !== facilityFilter){ skippedFacility++; continue; }
+          }
           const woNumber = String(po).trim();
           const colour = row[cColor] ? String(row[cColor]).trim() : '(no colour)';
           const size = row[cSize] ? String(row[cSize]).trim() : '(no size)';
-          const ts = cCreated>-1 && row[cCreated] ? (Date.parse(row[cCreated]) || Date.now()) : Date.now();
+          const parsedCreated = cCreated>-1 && row[cCreated] ? Date.parse(row[cCreated]) : NaN;
+          const hasRealDate = !isNaN(parsedCreated);
+          const ts = hasRealDate ? parsedCreated : Date.now();
+          if(minImportTs && hasRealDate && ts < minImportTs){ skippedOldDate++; continue; }
           const candidate = { serial, woNumber, colour, size, ts };
           const existing = bestRowForSerial[serial];
           if(!existing || ts >= existing.ts) bestRowForSerial[serial] = candidate;
@@ -1752,7 +1877,7 @@ function handleImportAssociationReport(e){
       pushBatchDocs('records', touchedRecords);
       pushBatchDocs('history', touchedHistory);
       state.lastSyncedAt = Date.now(); save();
-      alert(`Import complete.\n${created} new serial(s) linked, ${updated} association record(s) written.\nSkipped: ${skippedNoPO} with no PO number, ${skippedTest} test/UAT/non-production rows.`);
+      alert(`Import complete.\n${created} new serial(s) linked, ${updated} association record(s) written.\nSkipped: ${skippedNoPO} with no PO number, ${skippedTest} test/UAT/non-production rows${facilityFilter ? `, ${skippedFacility} from a different facility` : ''}${minImportTs ? `, ${skippedOldDate} older than the date cutoff` : ''}.`);
       render();
     }catch(err){
       alert('Could not read that file: ' + err.message);
