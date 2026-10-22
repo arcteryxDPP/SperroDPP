@@ -241,15 +241,30 @@ function initFirebaseSync(config){
 function attachSyncListeners(){
   if(!db || syncListenersAttached) return;
   syncListenersAttached = true;
+  // Applies only what actually changed in this snapshot (added/modified/removed) to the given
+  // keyed object, instead of replacing the whole thing — so a snapshot delivered for unrelated
+  // activity elsewhere can never clobber a write this device just made that hasn't round-tripped yet.
+  function applyKeyedChanges(snap, obj){
+    snap.docChanges().forEach(change=>{
+      if(change.type === 'removed') delete obj[change.doc.id];
+      else obj[change.doc.id] = change.doc.data();
+    });
+  }
   db.collection('workOrders').onSnapshot(snap=>{
     if(snap.empty && state.workOrders.length){
       const seed = {}; state.workOrders.forEach(wo=>{ seed[wo.id]=wo; });
       pushBatchDocs('workOrders', seed);
       return;
     }
-    const wos = [];
-    snap.forEach(doc => wos.push(doc.data()));
-    state.workOrders = wos;
+    snap.docChanges().forEach(change=>{
+      const idx = state.workOrders.findIndex(w=>w.id===change.doc.id);
+      if(change.type==='removed'){
+        if(idx>-1) state.workOrders.splice(idx,1);
+      } else {
+        const data = change.doc.data();
+        if(idx>-1) state.workOrders[idx] = data; else state.workOrders.push(data);
+      }
+    });
     save(); render();
   }, err=>{ syncStatus='error'; syncError=err.message; render(); });
   db.collection('assignment').onSnapshot(snap=>{
@@ -257,9 +272,7 @@ function attachSyncListeners(){
       pushBatchDocs('assignment', state.assignment);
       return;
     }
-    const a = {};
-    snap.forEach(doc => a[doc.id] = doc.data());
-    state.assignment = a;
+    applyKeyedChanges(snap, state.assignment);
     save(); render();
   }, err=>{ syncStatus='error'; syncError=err.message; render(); });
   db.collection('records').onSnapshot(snap=>{
@@ -267,9 +280,7 @@ function attachSyncListeners(){
       pushBatchDocs('records', state.records);
       return;
     }
-    const r = {};
-    snap.forEach(doc => r[doc.id] = doc.data());
-    state.records = r;
+    applyKeyedChanges(snap, state.records);
     save(); render();
   }, err=>{ syncStatus='error'; syncError=err.message; render(); });
   db.collection('qcChecks').onSnapshot(snap=>{
@@ -277,9 +288,7 @@ function attachSyncListeners(){
       pushBatchDocs('qcChecks', state.qcChecks);
       return;
     }
-    const q = {};
-    snap.forEach(doc => q[doc.id] = doc.data());
-    state.qcChecks = q;
+    applyKeyedChanges(snap, state.qcChecks);
     save(); render();
   }, err=>{ syncStatus='error'; syncError=err.message; render(); });
   db.collection('writtenOff').onSnapshot(snap=>{
@@ -287,9 +296,7 @@ function attachSyncListeners(){
       pushBatchDocs('writtenOff', state.writtenOff);
       return;
     }
-    const w = {};
-    snap.forEach(doc => w[doc.id] = doc.data());
-    state.writtenOff = w;
+    applyKeyedChanges(snap, state.writtenOff);
     save(); render();
   }, err=>{ syncStatus='error'; syncError=err.message; render(); });
   // History is an append-only log that any device can add to — merge in cloud entries
@@ -660,8 +667,9 @@ function logResult(serial, status, source){
 /* ============================= WO STATS / FLAGGING ============================= */
 function sizeStats(wo, sizeRow){
   const serials = serialsForSizeRow(wo, sizeRow);
-  let pass=0, fail=0, writtenOff=0;
+  let pass=0, fail=0, writtenOff=0, qcChecked=0;
   serials.forEach(s=>{
+    if(state.qcChecks[s]) qcChecked++;
     if(state.writtenOff[s]){ writtenOff++; return; } // written-off units are excluded from needing association at all
     const r = state.records[s];
     if(r && r.status==='pass') pass++;
@@ -673,7 +681,7 @@ function sizeStats(wo, sizeRow){
   const effectiveQty = Math.max(qty - writtenOff, 0); // units actually still expected to be associated
   // Flag: target is known, every unit still expected has been through QC at least once, but pass count is short
   const flagged = targetSet && ((pass+fail) >= effectiveQty) && (pass < effectiveQty);
-  return {pass, fail, writtenOff, scanned, qty, effectiveQty, targetSet, flagged, count: serials.length};
+  return {pass, fail, writtenOff, qcChecked, scanned, qty, effectiveQty, targetSet, flagged, count: serials.length};
 }
 function woStats(wo){
   const sizes = wo.sizes.map(sz => ({...sz, stats: sizeStats(wo, sz)}));
@@ -681,10 +689,11 @@ function woStats(wo){
   const pass = sizes.reduce((a,s)=>a+s.stats.pass,0);
   const fail = sizes.reduce((a,s)=>a+s.stats.fail,0);
   const writtenOff = sizes.reduce((a,s)=>a+s.stats.writtenOff,0);
+  const qcChecked = sizes.reduce((a,s)=>a+s.stats.qcChecked,0);
   const effectiveQty = sizes.reduce((a,s)=>a+s.stats.effectiveQty,0);
   const flagged = sizes.some(s=>s.stats.flagged);
   const anyTargetSet = sizes.some(s=>s.stats.targetSet);
-  return {sizes, qty, pass, fail, writtenOff, effectiveQty, flagged, anyTargetSet};
+  return {sizes, qty, pass, fail, writtenOff, qcChecked, effectiveQty, flagged, anyTargetSet};
 }
 
 /* ============================= RENDER: ROUTER ============================= */
@@ -809,6 +818,7 @@ function renderResultPanel(serial){
       </div>
       <p class="hint" style="margin-top:12px; color:var(--pass);">QC check logged automatically${qc ? ' at '+fmtTime(qc.ts) : ''} — this unit was already confirmed associated.</p>
       <button class="btn btn-primary" id="btn-rescan" style="width:100%;">Scan next</button>
+      ${currentResultRaw && /^https?:\/\//i.test(currentResultRaw) ? `<a href="${esc(currentResultRaw)}" target="_blank" class="btn btn-ghost" style="width:100%; margin-top:8px; display:block; text-align:center; text-decoration:none; box-sizing:border-box;">Double-check this link manually</a>` : ''}
       <button class="btn btn-ghost btn-sm" id="btn-override-fail" style="width:100%; margin-top:8px;">The DPP link actually failed — flag this one</button>`;
   } else {
     const already = record ? `<div style="margin-top:6px; font-size:12px; color:var(--ink-dim)">Previously logged ${record.status} at ${fmtTime(record.ts)} — recheck below if it has since been fixed on the line.</div>` : '';
@@ -1247,15 +1257,17 @@ function renderDashboard(){
   const totalQty = all.reduce((a,s)=>a+s.qty,0);
   const totalPass = all.reduce((a,s)=>a+s.pass,0);
   const totalWrittenOff = all.reduce((a,s)=>a+s.writtenOff,0);
+  const totalQcChecked = all.reduce((a,s)=>a+s.qcChecked,0);
   const totalEffectiveQty = all.reduce((a,s)=>a+s.effectiveQty,0);
   const totalFlags = all.filter(s=>s.flagged).length;
 
   let html = filterCard + `<div class="card">
     <h2>Production run overview</h2>
-    <div class="stat-grid">
+    <div class="stat-grid" style="grid-template-columns:repeat(4,1fr);">
       <div class="stat"><div class="n">${totalQty || '—'}</div><div class="l">Target units${totalQty?'':' (TBD)'}</div></div>
       <div class="stat"><div class="n" style="color:var(--pass)">${totalPass}</div><div class="l">Associated</div></div>
       <div class="stat"><div class="n" style="color:var(--ink-dim)">${totalQty ? Math.max(totalEffectiveQty-totalPass,0) : '—'}</div><div class="l">Remaining</div></div>
+      <div class="stat"><div class="n">${totalQcChecked}</div><div class="l">QC Checked</div></div>
     </div>
     ${totalWrittenOff ? `<p class="hint" style="margin-top:8px; margin-bottom:0;">${totalWrittenOff} unit${totalWrittenOff>1?'s':''} written off (defect/reference) — excluded from target above.</p>` : ''}
     ${totalFlags ? `<div class="flag-banner" style="margin-top:10px;">${totalFlags} Work Order${totalFlags>1?'s':''} flagged &mdash; fully processed but association count doesn't match. See below.</div>` : ''}
