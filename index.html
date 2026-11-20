@@ -1981,10 +1981,14 @@ render();
 // Deliberately placed at the very end of the script: initFirebaseSync() triggers render(),
 // which depends on state declared throughout this file — calling it any earlier risks a
 // "cannot access before initialization" error on variables not yet reached.
-{
+// Retries a few times with short delays: a freshly-presented in-app browser view (e.g. from
+// the Shortcut's "Open URLs" step) can take a moment for its storage to be readable, and a
+// single immediate check can come back empty even though the config is genuinely saved.
+(function tryAutoConnect(attempt){
   const savedFbConfig = loadFirebaseConfig();
-  if(savedFbConfig) initFirebaseSync(savedFbConfig);
-}
+  if(savedFbConfig){ initFirebaseSync(savedFbConfig); return; }
+  if(attempt < 6) setTimeout(()=>tryAutoConnect(attempt+1), 400);
+})(0);
 
 // Accepts a serial/URL handed in via ?scan=... (e.g. from an iOS Shortcut using Apple's
 // own native barcode scanner) and shows the result immediately, no typing or pasting needed.
