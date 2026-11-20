@@ -214,8 +214,7 @@ function clearFirebaseConfig(){ localStorage.removeItem(FB_CONFIG_KEY); }
 
 function initFirebaseSync(config){
   if(syncListenersAttached){
-    // Already connected and listening this session — re-entering this function would try to
-    // enable persistence on a Firestore instance that's already been used, which always throws.
+    // Already connected and listening this session — nothing to redo.
     syncStatus = 'connected'; syncError = null;
     render();
     return;
@@ -223,29 +222,14 @@ function initFirebaseSync(config){
   try{
     if(!firebase.apps || !firebase.apps.length) firebase.initializeApp(config);
     db = firebase.firestore();
-    const startListening = () => {
-      attachSyncListeners();
-      syncStatus = 'connected'; syncError = null;
-      render();
-    };
-    // Caches data in IndexedDB across sessions — repeat opens serve from local cache instantly
-    // and only sync the delta, instead of re-downloading the whole collection over the network
-    // every time. Purely an optimization: if enabling it fails for any reason (multiple tabs,
-    // unsupported browser, or an SDK version that throws this synchronously instead of
-    // rejecting), skip it and connect normally rather than letting it block the actual sync.
-    let persistenceAttempt = null;
-    try{
-      if(db.enablePersistence) persistenceAttempt = db.enablePersistence({synchronizeTabs:true});
-    }catch(syncErr){
-      console.warn('Firestore offline persistence unavailable:', syncErr.code||syncErr.message);
-    }
-    if(persistenceAttempt && typeof persistenceAttempt.then === 'function'){
-      persistenceAttempt
-        .catch(e=>{ console.warn('Firestore offline persistence unavailable:', e.code||e.message); })
-        .then(startListening);
-    } else {
-      startListening();
-    }
+    // Deliberately not using Firestore's IndexedDB persistence here: this app gets opened as
+    // a fresh tab on every single Shortcut-driven scan, and multiple same-origin tabs trying to
+    // coordinate one shared offline cache (especially with iOS Safari suspending background tabs)
+    // can leave the connection hung indefinitely with no error at all, rather than failing cleanly.
+    // The direct per-serial double-check lookup already covers the slow-sync case this was for.
+    attachSyncListeners();
+    syncStatus = 'connected'; syncError = null;
+    render();
   }catch(e){
     db = null; syncStatus = 'error'; syncError = e.message;
     render();
