@@ -158,6 +158,22 @@ function freshState(){
 /* ============================= LIVE SYNC (FIREBASE) — declared early so init below can use it ============================= */
 const FB_CONFIG_KEY = "arc_dpp_fb_config";
 let db = null, syncStatus = 'disconnected', syncError = null, syncListenersAttached = false;
+let privateBrowsingSuspected = false;
+// Private Browsing tabs can't open a normal IndexedDB database in Safari — that's the most
+// reliable signal available to a webpage. If this fails (or IndexedDB isn't there at all),
+// treat it as a strong hint, not certainty, since this varies by browser/version.
+function checkPrivateBrowsing(){
+  try{
+    if(!window.indexedDB){ privateBrowsingSuspected = true; render(); return; }
+    const req = indexedDB.open('__private_check__');
+    req.onerror = () => { privateBrowsingSuspected = true; render(); };
+    req.onsuccess = () => {
+      try{ indexedDB.deleteDatabase('__private_check__'); }catch(e){}
+    };
+  }catch(e){
+    privateBrowsingSuspected = true; render();
+  }
+}
 const HISTORY_SYNC_LIMIT = 1000;
 let locallyPushedHistoryKeys = new Set(); // entries this device has logged this session — never truncated away locally
 
@@ -725,6 +741,10 @@ function render(){
 /* ============================= SCAN TAB ============================= */
 function renderScan(){
   return `
+  ${privateBrowsingSuspected ? `<div class="card" style="border-color:var(--warn);">
+    <div style="display:flex; gap:6px; flex-wrap:wrap;"><span class="badge badge-warn">&#9888; Private Browsing detected</span></div>
+    <p class="hint" style="margin-top:8px; margin-bottom:0;">This tab can't save or sync anything while Private Browsing is on — scans here won't be remembered. Open Safari's tabs view (bottom right) and switch to your normal tab group, then reopen this page.</p>
+  </div>` : ''}
   <div class="card">
     <h2>Scan garment code</h2>
     <p class="hint">Uses your Shortcut, which reads the code with Apple's own scanner — far more reliable on these labels than scanning in-browser. Lands you right back here with the result.</p>
@@ -1504,6 +1524,7 @@ function renderSettings(){
     <h2>Live sync (Firebase)</h2>
     <p class="hint">Connects Work Orders, associations, and QC checks across every device that uses this same link — so this device's Dashboard shows what's happened everywhere else too, not just on this iPad. The serial pool and Log stay local to each device.</p>
     <div style="margin-bottom:10px;">${statusBadge}</div>
+    ${privateBrowsingSuspected ? `<p class="hint" style="color:var(--warn); margin-top:-4px;">&#9888; Private Browsing detected on this tab — that's very likely why this won't connect. Switch to a normal Safari tab and reopen the page.</p>` : ''}
     ${syncStatus==='error' ? `<p class="hint" style="color:var(--fail);">${esc(syncError||'Unknown error')}</p>` : ''}
     ${syncStatus==='connected' ? `
       <button class="btn btn-ghost" id="btn-fb-disconnect" style="width:100%;">Disconnect</button>
@@ -1984,6 +2005,8 @@ render();
 // Retries a few times with short delays: a freshly-presented in-app browser view (e.g. from
 // the Shortcut's "Open URLs" step) can take a moment for its storage to be readable, and a
 // single immediate check can come back empty even though the config is genuinely saved.
+checkPrivateBrowsing();
+
 (function tryAutoConnect(attempt){
   const savedFbConfig = loadFirebaseConfig();
   if(savedFbConfig){ initFirebaseSync(savedFbConfig); return; }
